@@ -10,7 +10,8 @@ public static class FileMcpConstants
     public static readonly string[] LegacySupportedVersions = ["2025-03-26", "2025-06-18", "2025-11-25"];
     public static readonly string[] AllSupportedVersions = [ModernProtocolVersion, "2025-11-25", "2025-06-18", "2025-03-26"];
     public const string ServerName = "filemcp";
-    public const string ServerVersion = "0.4.0-windows";
+    public const string Version = "0.4.0";
+    public static readonly string ServerVersion = Version + "-" + FileMcpPlatform.Name;
     public const string LocalAuthHeaderName = "X-FileMCP-Local-Token";
 
     public const int MaxFileBytes = 5_000_000;
@@ -81,8 +82,7 @@ public sealed class FileMcpSettings
     public string TunnelId { get; set; } = "";
     public string Profile { get; set; } = "filemcp";
     public int Port { get; set; } = 8008;
-    public string AllowedDirectory { get; set; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "FileMCP");
+    public string AllowedDirectory { get; set; } = FileMcpPlatform.DefaultSharedDirectory;
     public string HealthAddress { get; set; } = "127.0.0.1:0";
     public string GitUserName { get; set; } = "";
     public string GitUserEmail { get; set; } = "";

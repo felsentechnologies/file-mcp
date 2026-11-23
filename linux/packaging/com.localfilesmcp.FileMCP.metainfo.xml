@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.localfilesmcp.FileMCP</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>FileMCP</name>
+  <developer id="io.github.felsentechnologies">
+    <name>Felsen Technologies</name>
+  </developer>
+  <summary>Share a local workspace with ChatGPT through MCP</summary>
+  <description>
+    <p>
+      FileMCP gives ChatGPT controlled access to one local workspace through the Model Context Protocol.
+      It can read and modify files, run Git operations and, only when explicitly enabled, run shell commands.
+    </p>
+    <p>
+      The MCP server listens only on the loopback interface and is reached through the OpenAI Secure MCP Tunnel.
+      The runtime API key is stored in the Secret Service keyring, never in the settings file.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.localfilesmcp.FileMCP.desktop</launchable>
+  <url type="homepage">https://github.com/felsentechnologies/file-mcp</url>
+  <categories>
+    <category>Development</category>
+  </categories>
+  <provides>
+    <binary>filemcp</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>

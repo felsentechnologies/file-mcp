@@ -105,8 +105,8 @@ public static class ProcessRunner
         bool utf8Output = false)
     {
         ValidateProcessStrings(executable, arguments, cwd, environment);
-        var process = StartProcess(executable, arguments, cwd, environment, utf8Output);
-        using var job = WindowsJob.CreateAndAssign(process);
+        var process = StartProcess(executable, arguments, cwd, environment, utf8Output, out var processGroupLeader);
+        using var job = ProcessTreeGuard.CreateAndAssign(process, processGroupLeader);
         var stdout = new BoundedTextBuffer(outputLimitBytes);
         var stderr = new BoundedTextBuffer(outputLimitBytes);
         var stdoutTask = DrainAsync(process.StandardOutput, stdout);
@@ -121,7 +121,7 @@ public static class ProcessRunner
             try
             {
                 await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
-                job?.Terminate(1);
+                job?.TerminateAfterLeaderExit();
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -168,9 +168,79 @@ public static class ProcessRunner
         Action<int> onExit)
     {
         ValidateProcessStrings(executable, arguments, cwd, environment);
-        var process = StartProcess(executable, arguments, cwd, environment, utf8Output: false);
-        return new ManagedProcess(process, WindowsJob.CreateAndAssign(process), onOutput, onExit);
+        var process = StartProcess(executable, arguments, cwd, environment, utf8Output: false, out var processGroupLeader, longLived: true);
+        return new ManagedProcess(process, ProcessTreeGuard.CreateAndAssign(process, processGroupLeader), onOutput, onExit);
     }
+
+    /// <summary>
+    /// On Linux, launches <paramref name="executable"/> through util-linux <c>setsid</c> so the child becomes the
+    /// leader of a new session and process group. Descendants stay in that group, which lets FileMCP terminate the
+    /// whole tree after the leader exits, mirroring the Windows Job Object kill-on-close behaviour.
+    /// </summary>
+    /// <remarks>
+    /// With <paramref name="parentDeathSignal"/>, util-linux <c>setpriv --pdeathsig TERM</c> is inserted as well, so the
+    /// child receives SIGTERM if FileMCP itself dies (crash or SIGKILL) instead of being orphaned. The kernel ties that
+    /// signal to the forking <em>thread</em>, so such children must be started on <see cref="LongLivedSpawner"/>.
+    /// </remarks>
+    internal static bool ConfigureLaunch(ProcessStartInfo startInfo, string executable, IReadOnlyList<string> arguments, bool parentDeathSignal = false)
+    {
+        string fileName = executable;
+        var wrapped = false;
+        if (!OperatingSystem.IsWindows())
+        {
+            var resolved = FileMcpPlatform.ResolveExecutable(executable);
+            if (!Path.IsPathRooted(resolved) || !FileMcpPlatform.IsExecutableFile(resolved))
+                throw new FileMcpException($"Could not launch {executable}: executable not found");
+            fileName = resolved;
+            if (SetsidPath is { } setsid)
+            {
+                startInfo.FileName = setsid;
+                startInfo.ArgumentList.Add("--");
+                if (parentDeathSignal && SetprivPath is { } setpriv)
+                {
+                    startInfo.ArgumentList.Add(setpriv);
+                    startInfo.ArgumentList.Add("--pdeathsig");
+                    startInfo.ArgumentList.Add("TERM");
+                    startInfo.ArgumentList.Add("--");
+                }
+                startInfo.ArgumentList.Add(resolved);
+                wrapped = true;
+            }
+        }
+        if (!wrapped) startInfo.FileName = fileName;
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+        return wrapped;
+    }
+
+    private static readonly Lazy<string?> SetsidLocation = new(() =>
+        Environment.GetEnvironmentVariable("FILEMCP_DISABLE_SETSID") == "1" ? null : FileMcpPlatform.FindSystemTool("setsid"));
+
+    private static string? SetsidPath => SetsidLocation.Value;
+
+    // setpriv gained --pdeathsig in util-linux 2.33 (Debian 10, Ubuntu 20.04, Fedora 30, RHEL 9); probe once.
+    private static readonly Lazy<string?> SetprivLocation = new(() =>
+    {
+        if (OperatingSystem.IsWindows() || Environment.GetEnvironmentVariable("FILEMCP_DISABLE_PDEATHSIG") == "1") return null;
+        var setpriv = FileMcpPlatform.FindSystemTool("setpriv");
+        var truePath = FileMcpPlatform.FindSystemTool("true");
+        if (setpriv is null || truePath is null) return null;
+        try
+        {
+            using var probe = Process.Start(new ProcessStartInfo(setpriv, ["--pdeathsig", "TERM", "--", truePath])
+            {
+                UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
+            });
+            if (probe is null) return null;
+            if (!probe.WaitForExit(5000)) { try { probe.Kill(); } catch { } return null; }
+            return probe.ExitCode == 0 ? setpriv : null;
+        }
+        catch { return null; }
+    });
+
+    private static string? SetprivPath => SetprivLocation.Value;
 
     internal static void KillProcessTree(Process process)
     {
@@ -194,11 +264,12 @@ public static class ProcessRunner
         IReadOnlyList<string> arguments,
         string? cwd,
         IReadOnlyDictionary<string, string>? environment,
-        bool utf8Output)
+        bool utf8Output,
+        out bool processGroupLeader,
+        bool longLived = false)
     {
         var startInfo = new ProcessStartInfo
         {
-            FileName = executable,
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -211,10 +282,8 @@ public static class ProcessRunner
             startInfo.StandardOutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
             startInfo.StandardErrorEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
         }
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
+        var useSpawner = longLived && !OperatingSystem.IsWindows();
+        processGroupLeader = ConfigureLaunch(startInfo, executable, arguments, parentDeathSignal: useSpawner);
         if (environment is not null)
         {
             startInfo.Environment.Clear();
@@ -227,7 +296,8 @@ public static class ProcessRunner
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         try
         {
-            if (!process.Start())
+            var started = useSpawner ? LongLivedSpawner.Start(process) : process.Start();
+            if (!started)
             {
                 throw new FileMcpException($"Could not launch {executable}.");
             }
@@ -281,7 +351,7 @@ public static class ProcessRunner
         {
             if (string.IsNullOrEmpty(pair.Key) || pair.Key.Contains('=') || pair.Key.Contains('\0'))
             {
-                throw new FileMcpException("Environment variable name is not valid for Windows process execution.");
+                throw new FileMcpException("Environment variable name is not valid for process execution.");
             }
             if (pair.Value.Contains('\0'))
             {
@@ -291,16 +361,53 @@ public static class ProcessRunner
     }
 }
 
+/// <summary>
+/// Starts long-lived children from one dedicated thread that lives as long as FileMCP. Linux delivers
+/// PR_SET_PDEATHSIG when the <em>forking thread</em> exits, so starting such children from short-lived
+/// thread-pool threads could kill them spuriously; a single permanent thread makes the signal fire only
+/// when the FileMCP process itself goes away.
+/// </summary>
+internal static class LongLivedSpawner
+{
+    private static readonly System.Collections.Concurrent.BlockingCollection<(Process Process, TaskCompletionSource<bool> Result)> Requests = new();
+    private static readonly Thread Worker = CreateWorker();
+
+    public static bool Start(Process process)
+    {
+        _ = Worker;
+        var result = new TaskCompletionSource<bool>();
+        Requests.Add((process, result));
+        return result.Task.GetAwaiter().GetResult();
+    }
+
+    private static Thread CreateWorker()
+    {
+        var thread = new Thread(Run) { IsBackground = true, Name = "FileMCP process spawner" };
+        thread.Start();
+        return thread;
+    }
+
+    private static void Run()
+    {
+        foreach (var (process, result) in Requests.GetConsumingEnumerable())
+        {
+            try { result.SetResult(process.Start()); }
+            catch (Exception ex) { result.SetException(ex); }
+        }
+    }
+}
+
 public sealed class ManagedProcess : IDisposable
 {
+    private static readonly TimeSpan UnixGracefulStopTimeout = TimeSpan.FromSeconds(3);
     private readonly Process _process;
-    private readonly WindowsJob? _job;
+    private readonly ProcessTreeGuard? _job;
     private readonly Action<string> _onOutput;
     private readonly Action<int> _onExit;
     private readonly CancellationTokenSource _disposeCts = new();
     private int _exitReported;
 
-    internal ManagedProcess(Process process, WindowsJob? job, Action<string> onOutput, Action<int> onExit)
+    internal ManagedProcess(Process process, ProcessTreeGuard? job, Action<string> onOutput, Action<int> onExit)
     {
         _process = process;
         _job = job;
@@ -322,6 +429,18 @@ public sealed class ManagedProcess : IDisposable
 
     public async Task StopAsync()
     {
+        if (_job is { SupportsGracefulStop: true } && IsRunning)
+        {
+            // Unix: SIGTERM the process group first so tunnel-client and shells can shut down cleanly.
+            _job.RequestTermination();
+            try
+            {
+                using var grace = new CancellationTokenSource(UnixGracefulStopTimeout);
+                await _process.WaitForExitAsync(grace.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            catch (InvalidOperationException) { }
+        }
         _job?.Terminate(1);
         ProcessRunner.KillProcessTree(_process);
         try
@@ -338,6 +457,11 @@ public sealed class ManagedProcess : IDisposable
 
     public void StopSynchronously()
     {
+        if (_job is { SupportsGracefulStop: true } && IsRunning)
+        {
+            _job.RequestTermination();
+            try { _process.WaitForExit(1500); } catch (InvalidOperationException) { }
+        }
         _job?.Terminate(1);
         ProcessRunner.KillProcessTree(_process);
         try
@@ -361,7 +485,7 @@ public sealed class ManagedProcess : IDisposable
         {
             await _process.WaitForExitAsync(_disposeCts.Token).ConfigureAwait(false);
             exitCode = _process.ExitCode;
-            _job?.Terminate(1);
+            _job?.TerminateAfterLeaderExit();
         }
         catch (OperationCanceledException)
         {
@@ -410,7 +534,62 @@ public sealed class ManagedProcess : IDisposable
     }
 }
 
-internal sealed class WindowsJob : IDisposable
+/// <summary>Keeps a child process and all of its descendants killable as one unit.</summary>
+internal abstract class ProcessTreeGuard : IDisposable
+{
+    /// <summary>Windows: a kill-on-close Job Object. Linux: the setsid process group, when the child leads one.</summary>
+    public static ProcessTreeGuard? CreateAndAssign(Process process, bool processGroupLeader)
+    {
+        if (OperatingSystem.IsWindows()) return WindowsJob.CreateAndAssign(process);
+        return processGroupLeader ? new UnixProcessGroup(process.Id) : null;
+    }
+
+    /// <summary>True when <see cref="RequestTermination"/> sends a catchable signal before the hard kill.</summary>
+    public virtual bool SupportsGracefulStop => false;
+
+    /// <summary>Forcefully terminates every process in the tree.</summary>
+    public abstract void Terminate(uint exitCode);
+
+    /// <summary>Asks the tree to exit (SIGTERM on Unix). Windows has no equivalent and terminates immediately.</summary>
+    public virtual void RequestTermination() => Terminate(1);
+
+    /// <summary>Kills descendants left behind after the leader exited, then stops signalling the group.</summary>
+    public virtual void TerminateAfterLeaderExit() => Terminate(1);
+
+    public abstract void Dispose();
+}
+
+/// <summary>
+/// A process group created by <c>setsid</c>. The group ID equals the leader's PID and cannot be reused while any
+/// member is alive, so signalling it right after the leader exits only reaches FileMCP-launched descendants.
+/// After that final sweep the guard retires so a later, unrelated process group can never be signalled.
+/// </summary>
+internal sealed class UnixProcessGroup(int processGroupId) : ProcessTreeGuard
+{
+    private int _retired;
+
+    public override bool SupportsGracefulStop => true;
+
+    public override void Terminate(uint exitCode) => Signal(UnixNative.SIGKILL);
+
+    public override void RequestTermination() => Signal(UnixNative.SIGTERM);
+
+    public override void TerminateAfterLeaderExit()
+    {
+        Signal(UnixNative.SIGKILL);
+        Interlocked.Exchange(ref _retired, 1);
+    }
+
+    public override void Dispose() => Interlocked.Exchange(ref _retired, 1);
+
+    private void Signal(int signal)
+    {
+        if (Volatile.Read(ref _retired) != 0 || processGroupId <= 1) return;
+        _ = UnixNative.Kill(-processGroupId, signal);
+    }
+}
+
+internal sealed class WindowsJob : ProcessTreeGuard
 {
     private readonly SafeFileHandle _handle;
 
@@ -468,13 +647,13 @@ internal sealed class WindowsJob : IDisposable
         return new WindowsJob(handle);
     }
 
-    public void Terminate(uint exitCode)
+    public override void Terminate(uint exitCode)
     {
         if (_handle.IsInvalid || _handle.IsClosed) return;
         _ = NativeMethods.TerminateJobObject(_handle, exitCode);
     }
 
-    public void Dispose() => _handle.Dispose();
+    public override void Dispose() => _handle.Dispose();
 
     private static class NativeMethods
     {

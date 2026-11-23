@@ -4,12 +4,14 @@ using System.Text;
 
 namespace FileMCP.Core;
 
-public sealed class WindowsCredentialStore
+public sealed class WindowsCredentialStore : IApiKeyStore
 {
     private const string DefaultTargetName = "FileMCP/runtime-api-key";
     private readonly string _targetName;
 
     public WindowsCredentialStore(string? targetName = null) => _targetName = targetName ?? DefaultTargetName;
+
+    public string StoreName => "Windows Credential Manager";
 
     public bool HasSavedApiKey
     {

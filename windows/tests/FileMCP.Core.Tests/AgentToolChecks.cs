@@ -13,6 +13,19 @@ internal static partial class Program
         catch (ArgumentException) { return false; }
     }
 
+    private static async Task<int> ReadPidFileAsync(string path)
+    {
+        // The shell creates the file before writing the PID, so wait for parseable content, not just existence.
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            try { if (int.TryParse(File.ReadAllText(path).Trim(), out var pid)) return pid; }
+            catch (IOException) { }
+            await Task.Delay(30);
+        }
+        throw new Exception("PID file was not written: " + path);
+    }
+
     private static async Task TestAgentToolsAsync(string testRoot)
     {
         var root = Path.Combine(testRoot, "agent-tools");
@@ -84,7 +97,9 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(root, "nested", "AGENTS.md"), new string('x', 20_000));
             context = await Call(safe, "workspace_context", Obj(("path", "nested")));
             Assert(context["files"]!.AsArray()[1]!["truncated"]!.GetValue<bool>(), "context is bounded");
-            var args = Obj(("request_id", "stream"), ("command", "[Console]::Write('first'); Start-Sleep -Seconds 2; [Console]::Write('second'); [Console]::Error.Write('error'); exit 7"), ("timeout_seconds", 10));
+            var args = Obj(("request_id", "stream"), ("command", IsWindows
+                ? "[Console]::Write('first'); Start-Sleep -Seconds 2; [Console]::Write('second'); [Console]::Error.Write('error'); exit 7"
+                : "printf first; sleep 2; printf second; printf error >&2; exit 7"), ("timeout_seconds", 10));
             var started = await Call(full, "start_command", args);
             var id = started["session_id"]!.GetValue<string>();
             Assert((await Call(full, "start_command", args))["session_id"]!.GetValue<string>() == id, "idempotent retry");
@@ -101,17 +116,17 @@ internal static partial class Program
             var completed = await Poll(id, partial["next_cursor"]!.GetValue<int>());
             Assert(completed["exit_code"]!.GetValue<int>() == 7 && completed["output"]!.GetValue<string>().Contains("second") && !completed["output"]!.GetValue<string>().Contains("first"), "cursor and nonzero exit");
             await AssertThrowsAsync(() => Call(full, "read_command_output", Obj(("session_id", id), ("cursor", 999999))), "cursor", "future cursor refused");
-            var cancel = await Call(full, "start_command", Obj(("request_id", "cancel"), ("command", "$child = Start-Process ping.exe -ArgumentList '-t 127.0.0.1' -PassThru -WindowStyle Hidden; $child.Id | Set-Content child.pid; Start-Sleep -Seconds 30")));
+            var cancel = await Call(full, "start_command", Obj(("request_id", "cancel"), ("command", IsWindows
+                ? "$child = Start-Process ping.exe -ArgumentList '-t 127.0.0.1' -PassThru -WindowStyle Hidden; $child.Id | Set-Content child.pid; Start-Sleep -Seconds 30"
+                : "sleep 60 & echo $! > child.pid; sleep 30")));
             var cancelId = cancel["session_id"]!.GetValue<string>();
-            watch.Restart();
-            while (!File.Exists(Path.Combine(root, "child.pid")) && watch.Elapsed < TimeSpan.FromSeconds(5)) await Task.Delay(30);
-            var pid = int.Parse(File.ReadAllText(Path.Combine(root, "child.pid")).Trim());
+            var pid = await ReadPidFileAsync(Path.Combine(root, "child.pid"));
             await Call(full, "cancel_command", Obj(("session_id", cancelId)));
             Assert((await Poll(cancelId))["state"]!.GetValue<string>() == "cancelled", "cancel reaches terminal state");
-            Assert(!IsProcessRunning(pid), "cancel kills descendants");
-            var timeout = await Call(full, "start_command", Obj(("request_id", "timeout"), ("command", "Start-Sleep -Seconds 30"), ("timeout_seconds", 1)));
+            Assert(await WaitForProcessExitAsync(pid, TimeSpan.FromSeconds(5)), "cancel kills descendants");
+            var timeout = await Call(full, "start_command", Obj(("request_id", "timeout"), ("command", IsWindows ? "Start-Sleep -Seconds 30" : "sleep 30"), ("timeout_seconds", 1)));
             Assert((await Poll(timeout["session_id"]!.GetValue<string>()))["state"]!.GetValue<string>() == "timed_out", "timeout state");
-            var flood = await Call(full, "start_command", Obj(("request_id", "flood"), ("command", "[Console]::Write(('x' * 1000000))")));
+            var flood = await Call(full, "start_command", Obj(("request_id", "flood"), ("command", IsWindows ? "[Console]::Write(('x' * 1000000))" : "head -c 1000000 /dev/zero | tr '\\0' x")));
             var floodId = flood["session_id"]!.GetValue<string>(); var page = await Poll(floodId); var total = 0;
             Assert(page["truncated"]!.GetValue<bool>(), "bounded output marks truncation");
             while (true)
@@ -128,12 +143,12 @@ internal static partial class Program
                 await Poll(result["session_id"]!.GetValue<string>());
             }
             await AssertThrowsAsync(() => Call(full, "start_command", args), "expired", "evicted retry cannot rerun");
-            var stop = await Call(full, "start_command", Obj(("request_id", "shutdown"), ("command", "$PID | Set-Content shutdown.pid; Start-Sleep -Seconds 30")));
-            watch.Restart();
-            while (!File.Exists(Path.Combine(root, "shutdown.pid")) && watch.Elapsed < TimeSpan.FromSeconds(5)) await Task.Delay(30);
-            var stopPid = int.Parse(File.ReadAllText(Path.Combine(root, "shutdown.pid")).Trim());
+            var stop = await Call(full, "start_command", Obj(("request_id", "shutdown"), ("command", IsWindows
+                ? "$PID | Set-Content shutdown.pid; Start-Sleep -Seconds 30"
+                : "echo $$ > shutdown.pid; sleep 30")));
+            var stopPid = await ReadPidFileAsync(Path.Combine(root, "shutdown.pid"));
             full.StopCommandSessions();
-            Assert(!IsProcessRunning(stopPid), "runtime shutdown kills process");
+            Assert(await WaitForProcessExitAsync(stopPid, TimeSpan.FromSeconds(5)), "runtime shutdown kills process");
             await AssertThrowsAsync(() => Call(full, "start_command", Obj(("request_id", "late"), ("command", "exit 0"))), "stopped", "no jobs after shutdown");
         }
         finally { full.StopCommandSessions(); }

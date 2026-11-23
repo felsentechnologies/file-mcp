@@ -7,11 +7,17 @@ public sealed class SettingsStore
     private readonly string _path;
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    /// <summary>
+    /// Windows: %LOCALAPPDATA%\FileMCP\settings.json. Linux: $XDG_CONFIG_HOME/filemcp/settings.json
+    /// (normally ~/.config/filemcp/settings.json). The API key is never stored here.
+    /// </summary>
     public SettingsStore(string? directory = null)
     {
-        var root = directory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FileMCP");
+        var root = directory ?? FileMcpPlatform.ConfigDirectory;
         _path = Path.Combine(root, "settings.json");
     }
+
+    public string FilePath => _path;
 
     public FileMcpSettings Load()
     {
@@ -21,7 +27,7 @@ public sealed class SettingsStore
             var settings = JsonSerializer.Deserialize<FileMcpSettings>(File.ReadAllText(_path), JsonOptions) ?? new FileMcpSettings();
             if (settings.Port is < 1 or > 65535) settings.Port = 8008;
             if (string.IsNullOrWhiteSpace(settings.Profile)) settings.Profile = "filemcp";
-            if (string.IsNullOrWhiteSpace(settings.AllowedDirectory)) settings.AllowedDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "FileMCP");
+            if (string.IsNullOrWhiteSpace(settings.AllowedDirectory)) settings.AllowedDirectory = FileMcpPlatform.DefaultSharedDirectory;
             if (string.IsNullOrWhiteSpace(settings.HealthAddress)) settings.HealthAddress = "127.0.0.1:0";
             return settings;
         }

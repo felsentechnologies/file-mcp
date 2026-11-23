@@ -1,4 +1,3 @@
-using System.Collections;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -6,27 +5,68 @@ namespace FileMCP.Core;
 
 internal sealed class ProfileLock : IDisposable
 {
-    private readonly Mutex _mutex;
+    private const string InUseMessage = "This tunnel profile is already in use by another FileMCP instance.";
+    private readonly Mutex? _mutex;
+    private readonly string? _lockPath;
+    private FileStream? _lockFile;
     private bool _held;
 
     public ProfileLock(string profile)
     {
         var hash = Fnv1A64(Encoding.UTF8.GetBytes(profile));
-        _mutex = new Mutex(false, $@"Local\FileMCP-profile-{hash:x16}");
+        if (OperatingSystem.IsWindows())
+        {
+            _mutex = new Mutex(false, $@"Local\FileMCP-profile-{hash:x16}");
+        }
+        else
+        {
+            // Like the macOS app: an advisory flock that the kernel drops automatically if FileMCP dies.
+            var directory = Path.Combine(FileMcpPlatform.RuntimeDirectory, "locks");
+            FileMcpPlatform.EnsurePrivateDirectory(directory);
+            _lockPath = Path.Combine(directory, $"profile-{hash:x16}.lock");
+            // .NET maps FileShare.None to flock(LOCK_EX | LOCK_NB) on Unix.
+            _lockOptions = new FileStreamOptions
+            {
+                Mode = FileMode.OpenOrCreate,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.None,
+                UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+            };
+        }
     }
+
+    private readonly FileStreamOptions? _lockOptions;
 
     public void Acquire()
     {
         if (_held) return;
-        try { _held = _mutex.WaitOne(0); }
-        catch (AbandonedMutexException) { _held = true; }
-        if (!_held) throw new FileMcpException("This tunnel profile is already in use by another FileMCP instance.");
+        if (_mutex is not null)
+        {
+            try { _held = _mutex.WaitOne(0); }
+            catch (AbandonedMutexException) { _held = true; }
+        }
+        else
+        {
+            try
+            {
+                _lockFile = new FileStream(_lockPath!, _lockOptions!);
+                _lockFile.SetLength(0);
+                var pid = Encoding.ASCII.GetBytes(Environment.ProcessId + "\n");
+                _lockFile.Write(pid); _lockFile.Flush();
+                _held = true;
+            }
+            catch (IOException) { _lockFile?.Dispose(); _lockFile = null; _held = false; }
+            catch (UnauthorizedAccessException ex) { throw new FileMcpException("Could not lock the tunnel profile: " + ex.Message); }
+        }
+        if (!_held) throw new FileMcpException(InUseMessage);
     }
 
     public void Dispose()
     {
-        if (_held) { try { _mutex.ReleaseMutex(); } catch { } _held = false; }
-        _mutex.Dispose();
+        if (_held && _mutex is not null) { try { _mutex.ReleaseMutex(); } catch { } }
+        _held = false;
+        _mutex?.Dispose();
+        _lockFile?.Dispose(); _lockFile = null;
     }
 
     private static ulong Fnv1A64(IEnumerable<byte> bytes)
@@ -184,11 +224,15 @@ public sealed class LocalMcpRuntime : IAsyncDisposable
 
     private static bool ValidHealthPort(string value) => value.Length > 0 && value.All(char.IsAsciiDigit) && uint.TryParse(value, out var port) && port <= 65535;
 
+    private static readonly string[] WindowsTunnelEnvironment = ["PATH","USERPROFILE","HOMEDRIVE","HOMEPATH","APPDATA","LOCALAPPDATA","TEMP","TMP","SystemRoot","WINDIR","LANG","LC_ALL","LC_CTYPE","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"];
+    // SSL_CERT_FILE/SSL_CERT_DIR let Go honour enterprise CA bundles on Linux; everything else matches macOS.
+    private static readonly string[] UnixTunnelEnvironment = ["PATH","HOME","USER","LOGNAME","TMPDIR","LANG","LC_ALL","LC_CTYPE","SSL_CERT_FILE","SSL_CERT_DIR","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"];
+
     private Dictionary<string, string> TunnelClientEnvironment(string apiKey, string localAuthToken)
     {
-        var inherited = Environment.GetEnvironmentVariables().Cast<DictionaryEntry>().ToDictionary(e => (string)e.Key, e => (string?)e.Value ?? "", StringComparer.OrdinalIgnoreCase);
-        string[] pass = ["PATH","USERPROFILE","HOMEDRIVE","HOMEPATH","APPDATA","LOCALAPPDATA","TEMP","TMP","SystemRoot","WINDIR","LANG","LC_ALL","LC_CTYPE","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"];
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var inherited = FileMcpPlatform.CurrentEnvironment();
+        var pass = FileMcpPlatform.IsWindows ? WindowsTunnelEnvironment : UnixTunnelEnvironment;
+        var result = new Dictionary<string, string>(FileMcpPlatform.EnvironmentVariableComparer);
         foreach (var key in pass) if (inherited.TryGetValue(key, out var value) && value.Length > 0) result[key] = value;
         foreach (var pair in inherited.Where(pair => pair.Key.StartsWith("MCP_TEST_", StringComparison.OrdinalIgnoreCase))) result[pair.Key] = pair.Value;
         var noProxy = (inherited.GetValueOrDefault("NO_PROXY") ?? inherited.GetValueOrDefault("no_proxy") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
@@ -199,15 +243,17 @@ public sealed class LocalMcpRuntime : IAsyncDisposable
 
     private string TunnelProfileDirectory()
     {
-        var directory = _profileDirectoryOverride ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FileMCP", "tunnel-profiles");
-        Directory.CreateDirectory(directory); return directory;
+        var directory = _profileDirectoryOverride ?? Path.Combine(FileMcpPlatform.DataDirectory, "tunnel-profiles");
+        // Profiles reference the API key indirectly, but keep them private like the macOS 0700 directory.
+        FileMcpPlatform.EnsurePrivateDirectory(directory); return directory;
     }
 
     private static string TunnelClientPath()
     {
-        var sibling = Path.Combine(AppContext.BaseDirectory, "tunnel-client.exe"); if (File.Exists(sibling)) return sibling;
+        var name = FileMcpPlatform.ExecutableFileName("tunnel-client");
+        var sibling = Path.Combine(AppContext.BaseDirectory, name); if (File.Exists(sibling)) return sibling;
         var overridePath = Environment.GetEnvironmentVariable("MCP_TUNNEL_CLIENT"); if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath)) return overridePath;
-        throw new FileMcpException("tunnel-client.exe was not found beside FileMCP.exe.");
+        throw new FileMcpException($"{name} was not found beside {FileMcpPlatform.ExecutableFileName("FileMCP")}.");
     }
 
     private static string MakeLocalAuthToken() => Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();

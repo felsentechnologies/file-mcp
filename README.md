@@ -3,6 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-12%2B-22293A?style=flat-square&logo=apple&logoColor=white" alt="macOS 12 or later">
   <img src="https://img.shields.io/badge/Windows-10%2F11-22293A?style=flat-square&logo=windows&logoColor=white" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/Linux-.deb%20%7C%20.rpm-22293A?style=flat-square&logo=linux&logoColor=white" alt="Linux .deb and .rpm packages">
   <img src="https://img.shields.io/badge/license-Apache--2.0-DB0F30?style=flat-square" alt="Apache 2.0 license">
   <img src="https://img.shields.io/badge/open-source-30394E?style=flat-square" alt="Open source">
 </p>
@@ -14,7 +15,7 @@
   <a href="#development-and-verification">Development</a>
 </p>
 
-FileMCP is a native **macOS and Windows** desktop application that gives ChatGPT controlled access to a local workspace through MCP. It can read and modify files, run Git operations, and—only when explicitly enabled—run local shell commands.
+FileMCP is a native **macOS, Windows and Linux** desktop application that gives ChatGPT controlled access to a local workspace through MCP. It can read and modify files, run Git operations, and—only when explicitly enabled—run local shell commands.
 
 The MCP server stays bound to `127.0.0.1`. By default, FileMCP uses OpenAI [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) to connect supported OpenAI products without a public MCP endpoint. On macOS, you can alternatively use your own Cloudflare Tunnel with a public HTTPS hostname and OAuth. Both options establish an outbound tunnel rather than opening an inbound router port.
 
@@ -28,7 +29,8 @@ FileMCP is an independent open-source project. It is not an official OpenAI prod
 - Native desktop implementations:
   - **Swift + AppKit** on macOS.
   - **C# + .NET 8 + WPF** on Windows.
-- Shared core tools on both platforms: filesystem access, Git, Codex-history import, MCP protocol support, OpenAI tunnel integration and optional command execution. Provider choices and permission controls differ; see [Application settings](#application-settings).
+  - **C# + .NET 8 + Avalonia** on Linux, sharing `FileMCP.Core` with Windows and shipped as `.deb`, `.rpm` and `.tar.gz`.
+- Shared core tools on every platform: filesystem access, Git, Codex-history import, MCP protocol support, OpenAI tunnel integration and optional command execution. Provider choices and permission controls differ; see [Application settings](#application-settings).
 - Compact macOS interface with a workspace overview, persistent connection controls and a saved light/dark appearance choice.
 - Local MCP server listens on **loopback only** (`127.0.0.1`).
 - Built-in filesystem tools are restricted to one configured workspace root; optional shell commands are not OS-sandboxed.
@@ -38,6 +40,7 @@ FileMCP is an independent open-source project. It is not an official OpenAI prod
 - Runtime API keys are stored in the operating system credential store:
   - macOS Keychain.
   - Windows Credential Manager.
+  - Linux Secret Service keyring (GNOME Keyring, KWallet, KeePassXC, …).
 - Process output, request sizes, search scope, and concurrency are bounded.
 - Descendant processes are cleaned up on timeout, stop, and application shutdown.
 - Official OpenAI `tunnel-client` binaries are vendored with documented provenance and checksums.
@@ -102,6 +105,10 @@ Use the **Dark / Light** button beside the app name to switch appearance. Screen
 | macOS Apple Silicon | Swift / AppKit | `darwin-arm64` | User shell (`zsh`/`sh`) |
 | Windows x64 | .NET 8 / WPF | `windows-amd64` | Windows PowerShell |
 | Windows ARM64 | .NET 8 / WPF | `windows-arm64` | Windows PowerShell |
+| Linux x86_64 (`.deb`, `.rpm`, `.tar.gz`) | .NET 8 / Avalonia | `linux-amd64` | User login shell (`$SHELL -lc`, fallback `/bin/sh`) |
+| Linux ARM64 (`.deb`, `.rpm`, `.tar.gz`) | .NET 8 / Avalonia | `linux-arm64` | User login shell (`$SHELL -lc`, fallback `/bin/sh`) |
+
+Linux packages target glibc-based distributions with an X11 or XWayland desktop session: Debian 11+, Ubuntu 20.04+ (including Linux Mint), Fedora, RHEL 9+ and openSUSE. CI installs them on Debian 12, Ubuntu 22.04/24.04, Fedora and openSUSE Tumbleweed.
 
 The macOS build scripts understand Intel (`darwin-amd64`), but that platform is not currently bundled in this repository. Add the matching official `tunnel-client` binary and license sidecar plus the matching official ripgrep binary before building for Intel macOS.
 
@@ -116,13 +123,14 @@ Choose one connection provider:
 
 | Provider | Requirements |
 | --- | --- |
-| OpenAI Secure MCP Tunnel · macOS and Windows | A tunnel associated with the intended ChatGPT workspace, plus a restricted Platform runtime API key with **Tunnels Read + Use**. Creating or editing a tunnel requires **Tunnels Read + Manage**. See the [official tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). |
+| OpenAI Secure MCP Tunnel · macOS, Windows and Linux | A tunnel associated with the intended ChatGPT workspace, plus a restricted Platform runtime API key with **Tunnels Read + Use**. Creating or editing a tunnel requires **Tunnels Read + Manage**. See the [official tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). |
 | Cloudflare Tunnel · macOS only | `cloudflared`, a Cloudflare tunnel and a public HTTPS hostname routed to the local server. Use a dashboard token or a locally authenticated named tunnel. This route does not require an OpenAI tunnel ID or Platform runtime key. |
 
 For development/building:
 
 - **macOS:** macOS 12 or later and Xcode or Xcode Command Line Tools with `swift`/`swiftc`.
 - **Windows:** Windows 10/11 and the .NET 8 SDK. Git for Windows is required for Git-tool verification and normal Git use.
+- **Linux:** the .NET 8 SDK and Git. Packaging uses `dpkg-deb` for `.deb` and `rpmbuild` (`apt install rpm` on Debian/Ubuntu, `dnf install rpm-build` on Fedora) for `.rpm`.
 
 ## Quick start
 
@@ -184,17 +192,53 @@ For a development run on Windows:
 ./run_windows_dev.ps1
 ```
 
+### Linux
+
+Build the x64 packages (every format whose tooling is installed):
+
+```bash
+./build_linux_app.sh
+```
+
+For ARM64 (cross-builds from x64), or to require specific formats:
+
+```bash
+./build_linux_app.sh --arch arm64
+./build_linux_app.sh --arch x64 --formats tar,deb,rpm
+```
+
+Outputs:
+
+```text
+dist/linux-x64/FileMCP/                 # portable application directory
+dist/FileMCP-v0.4.0-linux-x64.tar.gz    # portable archive
+dist/filemcp_0.4.0_amd64.deb            # Debian, Ubuntu, Linux Mint
+dist/filemcp-0.4.0-1.x86_64.rpm         # Fedora, RHEL, openSUSE
+```
+
+Install a package with the distribution package manager so dependencies are resolved:
+
+```bash
+sudo apt install ./dist/filemcp_0.4.0_amd64.deb     # Debian / Ubuntu / Mint
+sudo dnf install ./dist/filemcp-0.4.0-1.x86_64.rpm  # Fedora / RHEL
+sudo zypper install ./dist/filemcp-0.4.0-1.x86_64.rpm  # openSUSE
+```
+
+Then start **FileMCP** from the applications menu or run `filemcp`. Packages install the app in `/usr/lib/filemcp`, the `filemcp` launcher in `/usr/bin`, a desktop entry, hicolor icons and AppStream metadata. The portable archive runs from any directory with `./FileMCP/FileMCP`.
+
+The Linux app is self-contained (no separate .NET install). It needs a desktop session with X11 or XWayland, and `secret-tool` (`libsecret-tools` / `libsecret`) plus a running Secret Service provider such as GNOME Keyring or KWallet to save the runtime API key. If no keyring is available, FileMCP keeps a typed key in memory for that session only. It never writes the key to disk. `filemcp --hidden` starts in the tray, and launching FileMCP again re-opens the running window. Local builds are unsigned; repositories that publish these packages should sign them with their normal Debian/RPM signing keys.
+
 ### Configure FileMCP
 
 For the default OpenAI provider:
 
-1. Open **Connection** and enter the Secure MCP Tunnel ID and runtime API key. Saved keys go to macOS Keychain or Windows Credential Manager.
-2. Open **Workspace** on macOS (**Settings** on Windows) and choose the local folder to share. File tools can read, edit and delete files in that folder; additional permissions are off by default on macOS.
+1. Open **Connection** and enter the Secure MCP Tunnel ID and runtime API key. Saved keys go to macOS Keychain, Windows Credential Manager or the Linux Secret Service keyring.
+2. Open **Workspace** on macOS (**Settings** on Windows and Linux) and choose the local folder to share. File tools can read, edit and delete files in that folder; additional permissions are off by default on macOS.
 3. Click **Connect** to save the current configuration and start the local server and tunnel. Wait for **Connected**, then add it to ChatGPT as described [below](#add-the-mcp-server-in-chatgpt).
 
 On macOS, **Overview** summarizes the selected folder, enabled permissions and connection route. Use the top navigation for **Workspace**, **Connection** and **Activity**. The **Dark / Light** button remembers your appearance choice across launches; before a choice is saved, startup uses the system appearance.
 
-The macOS connection control is available on every tab. Disconnect before changing the provider, shared folder or permissions. **Activity** contains runtime logs, follow/clear controls and a copy action for troubleshooting. On Windows, connection controls are in **Connection**, and runtime output is in **Logs**. Settings saved during an active Windows session take effect the next time it starts.
+The macOS connection control is available on every tab. Disconnect before changing the provider, shared folder or permissions. **Activity** contains runtime logs, follow/clear controls and a copy action for troubleshooting. On Windows and Linux, connection controls are in **Connection**, and runtime output is in **Logs**. Settings saved during an active Windows or Linux session take effect the next time it starts.
 
 Closing the window keeps sharing active. Use **Disconnect** to stop sharing or **Quit FileMCP** to stop the app.
 
@@ -229,19 +273,20 @@ FileMCP does not listen on a public network interface; the local MCP endpoint re
 
 ## Application settings
 
-The two platforms share the core MCP tools but have different interfaces:
+The platforms share the core MCP tools but have different interfaces:
 
-| Interface | macOS | Windows |
-| --- | --- | --- |
-| Navigation | Overview, Workspace, Connection, Activity | Connection, Settings, Logs |
-| Connection action | Available on every tab | In Connection |
-| Appearance toggle | Saved Dark / Light choice | No in-app toggle |
-| Providers | OpenAI and Cloudflare | OpenAI |
-| Optional permissions | Shell, Git push and Codex history are separate | Shell control; no separate Git push/history switches |
+| Interface | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| Navigation | Overview, Workspace, Connection, Activity | Connection, Settings, Logs | Connection, Settings, Logs |
+| Connection action | Available on every tab | In Connection | In Connection and the tray menu |
+| Appearance toggle | Saved Dark / Light choice | No in-app toggle | No in-app toggle |
+| Providers | OpenAI and Cloudflare | OpenAI | OpenAI |
+| Optional permissions | Shell, Git push and Codex history are separate | Shell control; no separate Git push/history switches | Same as Windows |
+| Settings location | `UserDefaults` | `%LOCALAPPDATA%\FileMCP\settings.json` | `~/.config/filemcp/settings.json` (`$XDG_CONFIG_HOME`) |
 
 Technical settings live under **Advanced options**.
 
-On macOS, **Allow Git push to remote servers** and **Allow writing to Codex history** are separate Workspace permissions, both off by default. Disabled tools are omitted from the advertised list and rejected if a client calls a cached tool name. Git push can send repository content to configured remotes and use existing SSH identities. Codex history writes outside the shared folder. These switches do not sandbox shell commands: when shell access is enabled, commands retain the OS user's privileges. Windows retains its existing permission model.
+On macOS, **Allow Git push to remote servers** and **Allow writing to Codex history** are separate Workspace permissions, both off by default. Disabled tools are omitted from the advertised list and rejected if a client calls a cached tool name. Git push can send repository content to configured remotes and use existing SSH identities. Codex history writes outside the shared folder. These switches do not sandbox shell commands: when shell access is enabled, commands retain the OS user's privileges. Windows and Linux retain the existing permission model.
 
 
 | Setting | Purpose |
@@ -264,8 +309,9 @@ Closing the main window does not stop an active tunnel:
 
 - macOS: reopen FileMCP from the Dock.
 - Windows: FileMCP remains available in the system tray; double-click the tray icon or choose **Open FileMCP**.
+- Linux: FileMCP remains available in the system tray (StatusNotifierItem: KDE Plasma, Cinnamon, XFCE, MATE, LXQt, or GNOME with the AppIndicator extension). Without a tray, launch FileMCP again to re-open the running window; when nothing is connected and there is no tray, closing the window quits.
 
-Use **Quit FileMCP** on macOS or the Windows tray menu **Quit FileMCP** action to terminate the app and stop the runtime.
+Use **Quit FileMCP** on macOS, the Windows or Linux tray menu **Quit FileMCP** action, or the **Quit FileMCP** button to terminate the app and stop the runtime.
 
 ## Available MCP tools
 
@@ -309,9 +355,9 @@ Use **Quit FileMCP** on macOS or the Windows tray menu **Quit FileMCP** action t
 
 | Tool | Purpose |
 | --- | --- |
-| `save_conversation_to_codex` | Create a durable local Codex thread from supplied `user`/`assistant` messages and group it under **Projects** using the selected workspace path. Supported on macOS and Windows. The tool writes to the current user's Codex history outside the FileMCP workspace and verifies the imported turns through Codex app-server before reporting success. |
+| `save_conversation_to_codex` | Create a durable local Codex thread from supplied `user`/`assistant` messages and group it under **Projects** using the selected workspace path. Supported on macOS, Windows and Linux. The tool writes to the current user's Codex history outside the FileMCP workspace and verifies the imported turns through Codex app-server before reporting success. |
 
-FileMCP discovers the Codex CLI from the normal platform installation paths and `PATH`. You can override discovery with `CODEX_BIN` on either platform; on Windows, `CODEX_CLI_PATH`, Codex Desktop resource locations under `%LOCALAPPDATA%\OpenAI\Codex`, and the standalone install under `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` / `%CODEX_HOME%\packages\standalone\current` are also recognized.
+FileMCP discovers the Codex CLI from the normal platform installation paths and `PATH`. You can override discovery with `CODEX_BIN` on either platform; on Windows, `CODEX_CLI_PATH`, Codex Desktop resource locations under `%LOCALAPPDATA%\OpenAI\Codex`, and the standalone install under `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` / `%CODEX_HOME%\packages\standalone\current` are also recognized. On Linux, `CODEX_CLI_PATH`, `CODEX_INSTALL_DIR`, `$CODEX_HOME/packages/standalone/current/codex`, `~/.local/bin/codex`, `/usr/local/bin/codex` and `/usr/bin/codex` are checked before `PATH`.
 
 ### Optional command execution
 
@@ -323,6 +369,7 @@ run_command(command, cwd="", timeout_seconds=30)
 
 - macOS executes through the user's configured shell, falling back to `/bin/sh`.
 - Windows executes through Windows PowerShell with `-NoProfile -NonInteractive`.
+- Linux executes through the user's login shell (`$SHELL -lc`, falling back to `/bin/sh`) so profile `PATH` additions apply even when FileMCP starts from a desktop launcher.
 
 Only the working directory is constrained to the shared root. Once command execution is enabled, the command itself has the normal permissions of the signed-in user.
 
@@ -346,6 +393,7 @@ FileMCP intentionally treats the local workspace as a privileged boundary.
 - macOS resolves symlink targets and validates existing ancestors against the configured workspace root.
 - Windows resolves existing paths through Win32 handles (`GetFinalPathNameByHandleW`) so NTFS junctions, symbolic links, and other reparse-point escapes cannot be treated as ordinary in-root paths.
 - Windows containment is case-insensitive and rejects rooted/UNC input supplied where a relative workspace path is required.
+- Linux resolves existing paths with `realpath(3)`, so symbolic links anywhere in a path (including intermediate directories) are followed to their real target before the containment check. Containment is case-sensitive, and `\` is treated as an ordinary file-name character.
 - Recursive search runs the bundled ripgrep with a fixed argument set (`--no-config`, no symlink following, no preprocessors or PCRE2). Patterns and globs are passed as single `--regexp=`/`--glob=` arguments, and every returned path is re-validated against the workspace root before it is reported or read.
 - Individual file reads and writes are limited to **5 MB**. `apply_patch` additionally limits a batch to **32 MB** of aggregate source data; these limits do not imply whole-repository reads.
 - Text responses and search previews are truncated to bounded sizes.
@@ -376,6 +424,8 @@ Git operations and mutating MCP tools are serialized against each other so anoth
 - Executable, argument, and environment strings are validated before process launch; NUL-truncation and invalid environment names are rejected.
 - macOS launches children in dedicated process groups and cleans descendants on timeout/stop/parent exit.
 - Windows assigns children to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and also uses process-tree termination as a fallback.
+- Linux starts children through util-linux `setsid` in a dedicated session and process group. It stops them with `SIGTERM` and then `SIGKILL` on the whole group, and reaps leftover descendants when the leader exits. Long-lived children (`tunnel-client` and command sessions) also get `setpriv --pdeathsig TERM` from a dedicated spawner thread, so they stop even if FileMCP crashes or is killed.
+- While a tunnel is connected, FileMCP blocks idle system sleep: a power request on Windows, an activity assertion on macOS and a systemd-logind `idle:sleep` inhibitor on Linux. The display may still sleep, and on Linux lid-close suspend is unaffected by default.
 - `tunnel-client init`, `doctor`, and runtime processes participate in the same cancellation lifecycle.
 
 ### Secrets and tunnel runtime isolation
@@ -384,6 +434,7 @@ Runtime API keys are never stored in the plain settings file:
 
 - macOS stores the key in Keychain as a generic password.
 - Windows stores the key in Windows Credential Manager as a generic credential.
+- Linux stores the key in the freedesktop Secret Service (attributes `service=FileMCP`, `account=runtime-api-key`) through `secret-tool`, passing it only over pipes. There is no plaintext fallback. Without a keyring the key lives in memory for the session only.
 
 The API key is passed to `tunnel-client` through the child process environment rather than command-line arguments. Active API keys and per-runtime local-auth tokens are redacted from tunnel-client output before FileMCP surfaces it in logs or runtime errors.
 
@@ -391,6 +442,7 @@ FileMCP keeps generated tunnel profiles in an app-owned profile directory instea
 
 - macOS: `~/Library/Application Support/FileMCP/tunnel-profiles`
 - Windows: `%LOCALAPPDATA%\FileMCP\tunnel-profiles`
+- Linux: `~/.local/share/filemcp/tunnel-profiles` (`$XDG_DATA_HOME`, mode `0700`). Per-boot locks and the single-instance socket live in `$XDG_RUNTIME_DIR/filemcp`.
 
 The child `tunnel-client` receives an allowlisted environment rather than the app's complete ambient environment. FileMCP explicitly supplies its API/local-auth values, preserves normal proxy/locale/platform variables, forces loopback hosts into `NO_PROXY`, and prevents ambient `MCP_SERVER_URL`, health-socket, raw-HTTP-log, or other tunnel config variables from silently overriding the generated profile.
 
@@ -417,7 +469,7 @@ For private vulnerability reporting guidance, see [`SECURITY.md`](SECURITY.md).
                   │            FileMCP            │
                   │                               │
                   │  platform UI                  │
-                  │  AppKit (macOS) / WPF (Win)  │
+                  │ AppKit / WPF / Avalonia (Lin) │
                   │              │                │
                   │              ▼                │
                   │       runtime orchestration   │
@@ -431,11 +483,11 @@ For private vulnerability reporting guidance, see [`SECURITY.md`](SECURITY.md).
                   └───────────────────────────────┘
 ```
 
-OAuth for the Cloudflare route is implemented by FileMCP; `cloudflared` forwards requests to the loopback server. The two platforms use native UI and process APIs while sharing the core MCP tool behavior; Cloudflare and separate Git push/history permission switches are macOS-specific.
+OAuth for the Cloudflare route is implemented by FileMCP; `cloudflared` forwards requests to the loopback server. The platforms use native UI and process APIs while sharing the core MCP tool behavior; Windows and Linux share the same C# `FileMCP.Core`. Cloudflare and separate Git push/history permission switches are macOS-specific.
 
 ## MCP protocol compatibility
 
-Both platform implementations support modern discovery and legacy Streamable HTTP initialization used by supported MCP clients:
+Both implementations (Swift on macOS; the shared C# core on Windows and Linux) support modern discovery and legacy Streamable HTTP initialization used by supported MCP clients:
 
 - Modern protocol: `2026-07-28`, including `server/discover` and per-request metadata.
 - Legacy protocols: `2025-03-26`, `2025-06-18`, and `2025-11-25` through `initialize` negotiation.
@@ -456,19 +508,28 @@ Tool definitions include `outputSchema`, and successful tool responses provide s
 │   └── ProcessRunner.swift
 ├── windows/
 │   ├── src/FileMCP.App/        # WPF desktop application
-│   ├── src/FileMCP.Core/       # MCP, filesystem, Git, process, tunnel runtime
-│   ├── tests/FileMCP.Core.Tests/
+│   ├── src/FileMCP.Core/       # MCP, filesystem, Git, process, tunnel runtime (shared with Linux)
+│   ├── tests/FileMCP.Core.Tests/  # Integration suite for Windows and Linux
 │   └── assets/
+├── linux/
+│   ├── src/FileMCP.Linux/      # Avalonia desktop application (tray, single instance)
+│   ├── packaging/              # .desktop entry, AppStream metadata, Debian copyright
+│   └── FileMCP.Linux.sln
 ├── tests/
 │   ├── test_swift_runtime.sh
 │   ├── test_swift_ui.sh
 │   ├── test_swift_agent_tools.sh
-│   └── test_windows_runtime.ps1
+│   ├── test_windows_runtime.ps1
+│   ├── test_linux_runtime.sh
+│   └── test_linux_app.sh
 ├── vendor/tunnel-client/
+├── vendor/ripgrep/
 ├── build_macos_app.sh
 ├── build_windows_app.ps1
+├── build_linux_app.sh
 ├── run_macos_dev.sh
 ├── run_windows_dev.ps1
+├── run_linux_dev.sh
 └── create_source_archive.sh
 ```
 
@@ -514,7 +575,37 @@ Run the Windows integration suite:
 
 The Windows suite exercises Credential Manager, NTFS junction/reparse-point containment, Job Object process cleanup, Git for Windows safe mode, Codex-history import through a disk-backed fake app-server, legacy/modern MCP, and the full `tunnel-client` runtime lifecycle through an isolated fake tunnel client. To additionally exercise an installed real Codex app-server and delete the fixture afterward, set `FILEMCP_REAL_CODEX_E2E=1` before running the suite.
 
-GitHub Actions runs both macOS and Windows verification jobs. See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes, especially changes to path containment, Git safety, process execution, HTTP parsing, credential storage, or tunnel isolation.
+### Linux
+
+Build the Linux solution (Avalonia app, shared core and test harness):
+
+```bash
+dotnet build linux/FileMCP.Linux.sln -c Release -warnaserror
+```
+
+Development run (copies the vendored helpers beside the debug build, then launches it):
+
+```bash
+./run_linux_dev.sh
+```
+
+Run the Linux integration suite and the release smoke test:
+
+```bash
+./tests/test_linux_runtime.sh
+./build_linux_app.sh && ./tests/test_linux_app.sh
+```
+
+The Linux suite runs the same shared core checks as Windows. On Linux it also covers:
+
+- `realpath` symlink containment, including intermediate links, file links and case-sensitive paths;
+- process-group cleanup and the parent-death signal after a simulated crash;
+- `flock` profile locking, XDG directories and permission-bit preservation;
+- Secret Service storage and the runtime lifecycle.
+
+It uses a real Secret Service when one is reachable and otherwise a protocol-checking fake `secret-tool`. Set `FILEMCP_TEST_SECRET_SERVICE=real` to require the real one; CI starts GNOME Keyring inside `dbus-run-session`. The smoke test runs the packaged app under Xvfb with an isolated D-Bus session.
+
+GitHub Actions runs macOS, Windows and Linux verification jobs. The Linux job also installs the `.deb`/`.rpm` packages in Debian, Ubuntu, Fedora and openSUSE containers, including ARM64 under QEMU. See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes, especially changes to path containment, Git safety, process execution, HTTP parsing, credential storage, or tunnel isolation.
 
 ## `tunnel-client` provenance
 
@@ -525,6 +616,8 @@ FileMCP vendors official OpenAI `tunnel-client` v0.0.12 binaries for the platfor
 | `darwin-arm64` | `b1757220cf4722cec9085ee4a908cf0ee4c1a499a33bd99979b9a9c7669e29b1` |
 | `windows-amd64` | `6649169733686805ca16cccd91774594d0c017fd729c37ad4ce1cd18323d9ae8` |
 | `windows-arm64` | `480684ec1031fc2985c7e87f9d669e7dfda4012a8ecdab21eabe1b5deafdd656` |
+| `linux-amd64` | `ee9d4a75bc0b42f36f345aa96231e0db1ab00488122f34ebc99d6db055b6603e` |
+| `linux-arm64` | `0a48e6696de0df5951c013e40be81ce775e6644e209758c48795a0ecbda06406` |
 
 The binaries are extracted from release archives verified against the upstream `SHA256SUMS.txt`. Full archive checksums, source commit, and update instructions are documented in [`vendor/tunnel-client/README.md`](vendor/tunnel-client/README.md).
 
@@ -542,7 +635,7 @@ The script requires a clean working tree and uses `git archive`, preventing loca
 
 Do not create public release archives by zipping the entire working directory.
 
-Platform release builds are intentionally separate because signing/notarization requirements differ between macOS and Windows.
+Platform release builds are intentionally separate because signing/notarization requirements differ between macOS, Windows and Linux package repositories.
 
 ## Contributing
 

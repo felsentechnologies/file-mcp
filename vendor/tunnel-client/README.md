@@ -14,6 +14,8 @@ This directory contains official OpenAI `tunnel-client` binaries bundled with Fi
 | `darwin-arm64` | `42fb3138dc9c081d5777cb7e8bd1e041cc48b67c4978dbab3c5167ca1aabca02` | `b1757220cf4722cec9085ee4a908cf0ee4c1a499a33bd99979b9a9c7669e29b1` |
 | `windows-amd64` | `2a2804933924e38a502d62b61f0266cb80d56d65744f4c29876b2bf9c1544356` | `6649169733686805ca16cccd91774594d0c017fd729c37ad4ce1cd18323d9ae8` |
 | `windows-arm64` | `65ab54221554481bb1c23b6015b99abe0b7f79b08593f4fb17a9e2e25532281d` | `480684ec1031fc2985c7e87f9d669e7dfda4012a8ecdab21eabe1b5deafdd656` |
+| `linux-amd64` | `2bb693bd7b5cd28da7ce09cd9e309529dbb33b7cc9dc0058e62a064688f92c81` | `ee9d4a75bc0b42f36f345aa96231e0db1ab00488122f34ebc99d6db055b6603e` |
+| `linux-arm64` | `6813878a3edb82ebebb32fe5a859bc6327a81cce5bc7b635a2313174d26365d6` | `0a48e6696de0df5951c013e40be81ce775e6644e209758c48795a0ecbda06406` |
 
 Every archive checksum was verified against the official release `SHA256SUMS.txt`, and each bundled executable was extracted from its verified archive. The annotated `v0.0.12` tag resolves to source commit `881c9a8fed7cccbe6607cd419863bbca506b8215`.
 
@@ -25,7 +27,7 @@ The following files are preserved from the official release artifacts:
 - `NOTICE` — upstream OpenAI notice.
 - `<target>/THIRD-PARTY-LICENSES.txt` — platform-specific third-party license sidecar published with the corresponding release archive.
 
-The macOS and Windows build scripts copy the matching legal notices into distributable application packages.
+The macOS, Windows and Linux build scripts copy the matching legal notices into distributable application packages. The Linux `THIRD-PARTY-LICENSES.txt` sidecars are the `tunnel-client-v0.0.12-linux-<arch>-licenses.txt` files from the verified release archives; both are byte-identical to the standalone release assets of the same name.
 
 ## Verification
 
@@ -37,6 +39,16 @@ macOS example:
 shasum -a 256 tunnel-client-v0.0.12-darwin-arm64.zip
 shasum -a 256 vendor/tunnel-client/darwin-arm64/tunnel-client
 vendor/tunnel-client/darwin-arm64/tunnel-client --version
+```
+
+Linux example:
+
+```bash
+gh release download v0.0.12 -R openai/tunnel-client -p 'tunnel-client-v0.0.12-linux-amd64.zip' -p SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt
+unzip tunnel-client-v0.0.12-linux-amd64.zip tunnel-client tunnel-client-v0.0.12-linux-amd64-licenses.txt
+sha256sum vendor/tunnel-client/linux-amd64/tunnel-client
+vendor/tunnel-client/linux-amd64/tunnel-client --version
 ```
 
 Windows example:

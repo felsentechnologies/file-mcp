@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>FileMCP</AssemblyName>
+    <RootNamespace>FileMCP.Linux</RootNamespace>
+    <Version>0.4.0</Version>
+    <ApplicationIcon />
+    <!-- Avalonia compiled bindings: binding errors surface at build time. -->
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <!-- No ICU dependency: the UI is English-only and the core uses ordinal string rules. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Desktop app: the runtime is shipped self-contained by build_linux_app.sh. -->
+    <RuntimeIdentifiers>linux-x64;linux-arm64</RuntimeIdentifiers>
+    <!-- Disable the Avalonia.BuildServices build-telemetry task (it only runs when this list is non-empty).
+         build_linux_app.sh additionally exports AVALONIA_TELEMETRY_OPTOUT=1. -->
+    <UsedAvaloniaProducts></UsedAvaloniaProducts>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.3.23" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.23" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.23" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\windows\src\FileMCP.Core\FileMCP.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <AvaloniaResource Include="..\..\..\assets\branding\filemcp-v2\app-icon-256.png" Link="Assets\filemcp-256.png" />
+    <AvaloniaResource Include="..\..\..\assets\branding\filemcp-v2\app-icon-64.png" Link="Assets\filemcp-64.png" />
+    <AvaloniaResource Include="..\..\..\assets\branding\filemcp-v2\app-icon-32.png" Link="Assets\filemcp-32.png" />
+  </ItemGroup>
+</Project>

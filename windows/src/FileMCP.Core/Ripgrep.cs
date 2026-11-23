@@ -35,9 +35,11 @@ internal sealed class Ripgrep
         {
             return File.Exists(overridePath) ? overridePath : null;
         }
-        var sibling = Path.Combine(AppContext.BaseDirectory, "rg.exe");
+        var sibling = Path.Combine(AppContext.BaseDirectory, ExecutableName);
         return File.Exists(sibling) ? sibling : null;
     }
+
+    public static string ExecutableName => FileMcpPlatform.ExecutableFileName("rg");
 
     /// <summary><paramref name="arguments"/> must not contain positional values; <paramref name="target"/> is passed after <c>--</c>.</summary>
     /// <remarks><paramref name="limitFileSize"/> skips files over <see cref="MaxFileBytes"/>; file listings pass false so large files are still reported.</remarks>
@@ -47,7 +49,7 @@ internal sealed class Ripgrep
     {
         if (Executable is null)
         {
-            throw new FileMcpException("ripgrep (rg.exe) was not found beside FileMCP; search tools are unavailable");
+            throw new FileMcpException($"ripgrep ({ExecutableName}) was not found beside FileMCP; search tools are unavailable");
         }
 
         await _slots.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -127,7 +129,8 @@ internal sealed class Ripgrep
 
     public static string NormalizedPath(string value)
     {
-        var normalized = value.Replace('\\', '/');
+        // ripgrep already prints '/' on Unix, where '\' is a legal file-name character that must be preserved.
+        var normalized = FileMcpPlatform.IsWindows ? value.Replace('\\', '/') : value;
         return normalized.StartsWith("./", StringComparison.Ordinal) ? normalized[2..] : normalized;
     }
 
@@ -224,8 +227,10 @@ internal sealed class Ripgrep
 
     private static Dictionary<string, string> MinimalEnvironment()
     {
-        var environment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var name in new[] { "SystemRoot", "WINDIR" })
+        var environment = new Dictionary<string, string>(FileMcpPlatform.EnvironmentVariableComparer);
+        // Windows needs its system directories; on Unix ripgrep runs with an empty environment like on macOS.
+        var names = FileMcpPlatform.IsWindows ? new[] { "SystemRoot", "WINDIR" } : [];
+        foreach (var name in names)
         {
             var value = Environment.GetEnvironmentVariable(name);
             if (!string.IsNullOrEmpty(value)) environment[name] = value;

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=FileMCP
+GenericName=MCP Workspace Bridge
+Comment=Share a local workspace with ChatGPT through OpenAI Secure MCP Tunnel
+Exec=filemcp
+TryExec=filemcp
+Icon=filemcp
+Terminal=false
+Categories=Development;
+Keywords=MCP;ChatGPT;OpenAI;tunnel;files;git;
+StartupNotify=true
+StartupWMClass=filemcp
+SingleMainWindow=true

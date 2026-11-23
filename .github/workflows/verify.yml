@@ -201,3 +201,156 @@ jobs:
           name: FileMCP-windows-arm64
           path: dist/FileMCP-v0.4.0-windows-arm64.zip
           if-no-files-found: error
+
+  verify-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      MCP_HTTP_FUZZ_ITERATIONS: "40"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      AVALONIA_TELEMETRY_OPTOUT: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install Linux build and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            rpm xvfb dbus gnome-keyring libsecret-tools desktop-file-utils appstream \
+            libfontconfig1 libx11-6 libice6 libsm6 libxcursor1 libxext6 libxfixes3 libxi6 libxrandr2
+
+      - name: Read version
+        run: echo "FILEMCP_VERSION=$(sed -n 's:.*<Version>\([^<]*\)</Version>.*:\1:p' linux/src/FileMCP.Linux/FileMCP.Linux.csproj | head -n 1)" >> "$GITHUB_ENV"
+
+      - name: Verify vendored tunnel-client
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(cat vendor/tunnel-client/VERSION)" = "0.0.12"
+          echo "ee9d4a75bc0b42f36f345aa96231e0db1ab00488122f34ebc99d6db055b6603e  vendor/tunnel-client/linux-amd64/tunnel-client" | sha256sum -c -
+          echo "0a48e6696de0df5951c013e40be81ce775e6644e209758c48795a0ecbda06406  vendor/tunnel-client/linux-arm64/tunnel-client" | sha256sum -c -
+          echo "fbe3d5c7d3a6a14317915d4c058f97342c9a533654f533adcba3261acc821a33  vendor/tunnel-client/linux-amd64/THIRD-PARTY-LICENSES.txt" | sha256sum -c -
+          echo "2504135d0ddc2965429044fe06ea93d72582c3694f83b02eebe6cbc515dc9aaa  vendor/tunnel-client/linux-arm64/THIRD-PARTY-LICENSES.txt" | sha256sum -c -
+          vendor/tunnel-client/linux-amd64/tunnel-client --version | grep -q '^0.0.12+881c9a8fed7cccbe6607cd419863bbca506b8215 '
+          test -s vendor/tunnel-client/NOTICE
+
+      - name: Verify vendored ripgrep
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(cat vendor/ripgrep/VERSION)" = "15.2.0"
+          echo "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849  vendor/ripgrep/linux-amd64/rg" | sha256sum -c -
+          echo "c14cdb389f34e504d69e386cfc67d5c5d9a730a990de03ca6910b2a15e30386a  vendor/ripgrep/linux-arm64/rg" | sha256sum -c -
+          vendor/ripgrep/linux-amd64/rg --version | grep -q '^ripgrep 15.2.0 '
+          test -s vendor/ripgrep/COPYING && test -s vendor/ripgrep/LICENSE-MIT && test -s vendor/ripgrep/UNLICENSE
+
+      - name: Static verification
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n build_linux_app.sh run_linux_dev.sh tests/test_linux_runtime.sh tests/test_linux_app.sh
+          desktop-file-validate linux/packaging/com.localfilesmcp.FileMCP.desktop
+          appstreamcli validate --no-net linux/packaging/com.localfilesmcp.FileMCP.metainfo.xml
+
+      - name: Build Linux solution
+        run: dotnet build linux/FileMCP.Linux.sln -c Release -warnaserror
+
+      - name: Linux integration tests (real Secret Service)
+        run: |
+          dbus-run-session -- bash -c 'printf "ci-keyring" | gnome-keyring-daemon --unlock --components=secrets >/dev/null && FILEMCP_TEST_SECRET_SERVICE=real ./tests/test_linux_runtime.sh'
+
+      - name: Build Linux x64 packages
+        run: ./build_linux_app.sh --arch x64 --formats tar,deb,rpm
+
+      - name: Build Linux arm64 packages
+        run: ./build_linux_app.sh --arch arm64 --formats tar,deb,rpm
+
+      - name: Linux app smoke test
+        run: |
+          ./tests/test_linux_app.sh x64
+          ./tests/test_linux_app.sh arm64
+
+      - name: Verify Linux release resources
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for pair in x64:linux-amd64 arm64:linux-arm64; do
+            arch="${pair%%:*}"; tag="${pair##*:}"; root="dist/linux-$arch/FileMCP"
+            cmp LICENSE "$root/FileMCP-LICENSE.txt"
+            cmp vendor/tunnel-client/LICENSE "$root/tunnel-client-LICENSE.txt"
+            cmp vendor/tunnel-client/NOTICE "$root/tunnel-client-NOTICE.txt"
+            cmp "vendor/tunnel-client/$tag/THIRD-PARTY-LICENSES.txt" "$root/tunnel-client-THIRD-PARTY-LICENSES.txt"
+            cmp "vendor/tunnel-client/$tag/tunnel-client" "$root/tunnel-client"
+            cmp "vendor/ripgrep/$tag/rg" "$root/rg"
+            cmp vendor/ripgrep/COPYING "$root/ripgrep-COPYING.txt"
+            cmp vendor/ripgrep/LICENSE-MIT "$root/ripgrep-LICENSE-MIT.txt"
+            cmp vendor/ripgrep/UNLICENSE "$root/ripgrep-UNLICENSE.txt"
+          done
+          dpkg-deb --info "dist/filemcp_${FILEMCP_VERSION}_amd64.deb"
+          rpm -qpi "dist/filemcp-${FILEMCP_VERSION}-1.x86_64.rpm"
+          rpm -qp --requires "dist/filemcp-${FILEMCP_VERSION}-1.aarch64.rpm"
+
+      - name: Install .deb on the runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get install -y --no-install-recommends "./dist/filemcp_${FILEMCP_VERSION}_amd64.deb"
+          filemcp --version | grep -qx "FileMCP ${FILEMCP_VERSION} (linux-x64)"
+          test -x /usr/lib/filemcp/tunnel-client && test -x /usr/lib/filemcp/rg
+          test -f /usr/share/applications/com.localfilesmcp.FileMCP.desktop
+          test -f /usr/share/icons/hicolor/256x256/apps/filemcp.png
+          sudo apt-get remove -y filemcp
+          test ! -e /usr/bin/filemcp
+
+      - name: Set up QEMU for arm64 package checks
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Install packages on other distributions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          check() {
+            local platform="$1" image="$2" script="$3"
+            echo "::group::$image ($platform)"
+            docker run --rm --platform "$platform" -e DOTNET_EnableWriteXorExecute=0 -v "$PWD/dist:/dist:ro" "$image" bash -ec "$script"
+            echo "::endgroup::"
+          }
+          for pair in amd64:x86_64:x64 arm64:aarch64:arm64; do
+            IFS=: read -r deb rpm arch <<< "$pair"
+            platform="linux/$deb"
+            expect="FileMCP ${FILEMCP_VERSION} (linux-$arch)"
+            apt_install="export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq --no-install-recommends /dist/filemcp_${FILEMCP_VERSION}_${deb}.deb >/dev/null && filemcp --version | grep -qx '$expect' && echo ok"
+            check "$platform" debian:12 "$apt_install"
+            check "$platform" ubuntu:22.04 "$apt_install"
+            check "$platform" fedora:latest "dnf install -y -q /dist/filemcp-${FILEMCP_VERSION}-1.${rpm}.rpm >/dev/null && filemcp --version | grep -qx '$expect' && echo ok"
+            check "$platform" opensuse/tumbleweed "zypper --non-interactive --quiet install --allow-unsigned-rpm /dist/filemcp-${FILEMCP_VERSION}-1.${rpm}.rpm >/dev/null && filemcp --version | grep -qx '$expect' && echo ok"
+          done
+
+      - name: Upload Linux x64 packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileMCP-linux-x64
+          path: |
+            dist/FileMCP-v${{ env.FILEMCP_VERSION }}-linux-x64.tar.gz
+            dist/filemcp_${{ env.FILEMCP_VERSION }}_amd64.deb
+            dist/filemcp-${{ env.FILEMCP_VERSION }}-1.x86_64.rpm
+          if-no-files-found: error
+
+      - name: Upload Linux arm64 packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileMCP-linux-arm64
+          path: |
+            dist/FileMCP-v${{ env.FILEMCP_VERSION }}-linux-arm64.tar.gz
+            dist/filemcp_${{ env.FILEMCP_VERSION }}_arm64.deb
+            dist/filemcp-${{ env.FILEMCP_VERSION }}-1.aarch64.rpm
+          if-no-files-found: error

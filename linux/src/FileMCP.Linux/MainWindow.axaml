@@ -1,0 +1,105 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="FileMCP.Linux.MainWindow"
+        Title="FileMCP"
+        Width="620" Height="560" MinWidth="560" MinHeight="520"
+        WindowStartupLocation="CenterScreen"
+        Icon="avares://FileMCP/Assets/filemcp-256.png">
+    <Window.Styles>
+        <Style Selector="TextBlock.label">
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="TextBlock.hint">
+            <Setter Property="Foreground" Value="Gray"/>
+            <Setter Property="TextWrapping" Value="Wrap"/>
+        </Style>
+    </Window.Styles>
+
+    <Grid Margin="16" RowDefinitions="*,Auto">
+        <TabControl x:Name="MainTabs" Grid.Row="0" Margin="0,0,0,12">
+            <TabItem Header="Connection" x:Name="ConnectionTab">
+                <Grid Margin="4,16,4,4" ColumnDefinitions="150,*"
+                      RowDefinitions="Auto,10,Auto,Auto,18,Auto,18,Auto,18,Auto">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="label" Text="Tunnel ID"/>
+                    <TextBox x:Name="TunnelIdBox" Grid.Row="0" Grid.Column="1" Watermark="tunnel_…"
+                             ToolTip.Tip="OpenAI Secure MCP Tunnel ID (tunnel_ + 32 lowercase letters or digits)."/>
+
+                    <TextBlock Grid.Row="2" Grid.Column="0" Classes="label" Text="Runtime API key"/>
+                    <TextBox x:Name="ApiKeyBox" Grid.Row="2" Grid.Column="1" PasswordChar="•"
+                             ToolTip.Tip="Stored in your Secret Service keyring (GNOME Keyring, KWallet, …) after saving; never in the settings file."/>
+                    <Grid Grid.Row="3" Grid.Column="1" ColumnDefinitions="*,Auto" Margin="0,6,0,0">
+                        <TextBlock x:Name="ApiKeyStatusText" Grid.Column="0" Classes="hint" VerticalAlignment="Center"
+                                   Margin="0,0,12,0" Text="Checking keyring…"/>
+                        <Button x:Name="DeleteApiKeyButton" Grid.Column="1" Content="Delete API key" IsEnabled="False" Click="DeleteApiKey_Click"/>
+                    </Grid>
+
+                    <TextBlock Grid.Row="5" Grid.Column="0" Classes="label" Text="Status"/>
+                    <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                        <Ellipse x:Name="StatusDot" Width="10" Height="10" Fill="Gray" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="StatusText" VerticalAlignment="Center" Text="Disconnected"/>
+                    </StackPanel>
+
+                    <TextBlock Grid.Row="7" Grid.ColumnSpan="2" Classes="hint"
+                               Text="FileMCP connects this Linux computer to ChatGPT through OpenAI Secure MCP Tunnel. The local MCP server listens only on loopback."/>
+
+                    <StackPanel Grid.Row="9" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+                        <Button x:Name="SaveConnectionButton" Content="Save connection" Click="SaveConnection_Click"/>
+                        <Button x:Name="ConnectButton" Content="Connect" MinWidth="130" Classes="accent"
+                                HorizontalContentAlignment="Center" Click="Connect_Click"/>
+                    </StackPanel>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Settings" x:Name="SettingsTab">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="4,16,4,4">
+                        <Grid ColumnDefinitions="150,*,Auto">
+                            <TextBlock Grid.Column="0" Classes="label" Text="Shared directory"/>
+                            <TextBox x:Name="DirectoryBox" Grid.Column="1" Margin="0,0,8,0"/>
+                            <Button Grid.Column="2" Content="Browse…" Click="BrowseDirectory_Click"/>
+                        </Grid>
+
+                        <CheckBox x:Name="EnableCommandsCheckBox" Margin="150,14,0,0" Content="Allow shell commands"
+                                  ToolTip.Tip="Allow FileMCP to run shell commands with your Linux user's permissions."/>
+                        <TextBlock Margin="150,4,0,0" Classes="hint"
+                                   Text="Allows ChatGPT to run commands through your login shell ($SHELL -lc) with your Linux user's permissions. Enable only for workspaces you trust."/>
+
+                        <Expander x:Name="AdvancedExpander" Header="Advanced options" Margin="0,16,0,0" HorizontalAlignment="Stretch">
+                            <Grid Margin="0,8,0,0" ColumnDefinitions="150,*"
+                                  RowDefinitions="Auto,8,Auto,8,Auto,8,Auto,8,Auto">
+                                <TextBlock Grid.Row="0" Grid.Column="0" Classes="label" Text="Profile"/>
+                                <TextBox x:Name="ProfileBox" Grid.Row="0" Grid.Column="1"
+                                         ToolTip.Tip="Letters, numbers, '.', '_' or '-', maximum 128 characters."/>
+                                <TextBlock Grid.Row="2" Grid.Column="0" Classes="label" Text="MCP port"/>
+                                <TextBox x:Name="PortBox" Grid.Row="2" Grid.Column="1"/>
+                                <TextBlock Grid.Row="4" Grid.Column="0" Classes="label" Text="Health listener"/>
+                                <TextBox x:Name="HealthAddressBox" Grid.Row="4" Grid.Column="1"
+                                         ToolTip.Tip="Loopback only. Port 0 requests an ephemeral tunnel-client health/admin port."/>
+                                <TextBlock Grid.Row="6" Grid.Column="0" Classes="label" Text="Git name"/>
+                                <TextBox x:Name="GitNameBox" Grid.Row="6" Grid.Column="1"/>
+                                <TextBlock Grid.Row="8" Grid.Column="0" Classes="label" Text="Git email"/>
+                                <TextBox x:Name="GitEmailBox" Grid.Row="8" Grid.Column="1"/>
+                            </Grid>
+                        </Expander>
+
+                        <Button x:Name="SaveSettingsButton" Content="Save settings" HorizontalAlignment="Right"
+                                Margin="0,16,0,0" Click="SaveSettings_Click"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="Logs">
+                <TextBox x:Name="LogBox" Margin="0,8,0,0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                         FontFamily="DejaVu Sans Mono, Liberation Mono, Noto Sans Mono, Ubuntu Mono, monospace" FontSize="12"
+                         Background="#191919" Foreground="White"/>
+            </TabItem>
+        </TabControl>
+
+        <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
+            <TextBlock x:Name="CloseHintText" Grid.Column="0" Classes="hint" VerticalAlignment="Center" Margin="0,0,12,0"
+                       Text="Closing the window keeps FileMCP running in the background."/>
+            <Button Grid.Column="1" Content="Quit FileMCP" Click="Quit_Click"/>
+        </Grid>
+    </Grid>
+</Window>

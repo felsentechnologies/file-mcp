@@ -15,7 +15,7 @@ internal sealed class SafePathResolver
             throw new FileMcpException("Shared directory cannot be empty.");
         }
 
-        var expanded = Environment.ExpandEnvironmentVariables(rootPath.Trim());
+        var expanded = FileMcpPlatform.ExpandUserPath(rootPath);
         Directory.CreateDirectory(expanded);
         _rootPath = CanonicalizeExistingPath(Path.GetFullPath(expanded));
         Root = _rootPath;
@@ -67,8 +67,12 @@ internal sealed class SafePathResolver
         {
             return "";
         }
-        return Path.GetRelativePath(_rootPath, canonical).Replace('\\', '/');
+        return ToPortableRelativePath(Path.GetRelativePath(_rootPath, canonical));
     }
+
+    /// <summary>Uses '/' separators in tool output; on Unix '\' is a file-name character and is kept.</summary>
+    internal static string ToPortableRelativePath(string relative) =>
+        Path.DirectorySeparatorChar == '/' ? relative : relative.Replace(Path.DirectorySeparatorChar, '/');
 
     public FileAttributes GetAttributesWithoutFollowingFinalTarget(string path, string missingMessage)
     {
@@ -169,14 +173,17 @@ internal sealed class SafePathResolver
         {
             return true;
         }
-        return full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        var prefix = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
+        return full.StartsWith(prefix, FileMcpPlatform.PathComparison);
     }
 
     private static string CanonicalizeExistingPath(string path)
     {
         if (!OperatingSystem.IsWindows())
         {
-            return Path.GetFullPath(path);
+            // realpath(3) resolves every symbolic link component, so a link inside the shared
+            // directory that points outside it canonicalizes to its real, uncontained target.
+            return FileMcpPlatform.RealPath(path);
         }
 
         using var handle = NativeMethods.CreateFileW(
@@ -238,7 +245,7 @@ internal sealed class SafePathResolver
         string.Equals(
             TrimForComparison(Path.GetFullPath(lhs)),
             TrimForComparison(Path.GetFullPath(rhs)),
-            StringComparison.OrdinalIgnoreCase);
+            FileMcpPlatform.PathComparison);
 
     private static string TrimForComparison(string path) =>
         path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

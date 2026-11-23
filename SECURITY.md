@@ -10,7 +10,7 @@ Security fixes are applied to the latest release and the current `main` branch. 
 
 Do not open a public issue containing exploit details, secrets, tokens, private file contents, or sensitive logs.
 
-Use [GitHub private vulnerability reporting](https://github.com/anhnv02/file-mcp/security/advisories/new) when it is enabled. If that page is unavailable, do not post exploit details in a public issue; arrange a private channel with the repository maintainer before sharing details. Maintainers must enable and verify private reporting before announcing a public release.
+Use [GitHub private vulnerability reporting](https://github.com/felsentechnologies/file-mcp/security/advisories/new) when it is enabled. If that page is unavailable, do not post exploit details in a public issue; arrange a private channel with the repository maintainer before sharing details. Maintainers must enable and verify private reporting before announcing a public release.
 
 Include, when relevant:
 
@@ -30,12 +30,13 @@ Include, when relevant:
 - Legacy Cloudflare URL-secret compatibility is off by default and requires a warning before enabling. Its secret is separate from the OAuth login code. A copied URL grants all enabled MCP capabilities and may be captured by external client/proxy logs; FileMCP cannot redact third-party systems. Prefer OAuth.
 - The bundled tunnel health/admin listener is also loopback-only. FileMCP rejects public/LAN health bind addresses and passes the validated address explicitly to tunnel startup.
 - Built-in filesystem and safe-mode Git tools enforce application-level containment, not an operating-system sandbox.
-- macOS containment must account for symbolic links; Windows containment must account for case-insensitive paths, symbolic links, junctions, and other reparse points.
+- macOS containment must account for symbolic links; Windows containment must account for case-insensitive paths, symbolic links, junctions, and other reparse points; Linux containment must resolve every symbolic link component (`realpath`) and compare paths case-sensitively.
 - On macOS, Git push and Codex-history writing require independent Workspace permissions, both disabled by default. Disabled tools are neither advertised nor callable. `git_push` can transmit repository contents to a remote server and use allowed SSH identities. `save_conversation_to_codex` intentionally writes supplied messages to Codex history outside the shared root; it does not execute imported conversations. Windows retains its existing tool-permission model.
 - Enabling shell tools (`run_command` and command sessions) intentionally grants shell execution with the current OS user's permissions. Only the command working directory is constrained to the shared root; the command itself can access anything that user account can access.
 - Git safe mode validates worktree/Git/common/object/config metadata, alternates, embedded repositories, and config includes; suppresses hooks/filters/external diffs/templates/signing; resets credential helpers; and disables SSH config-driven `ProxyCommand`/`ProxyJump`. ssh-agent/default SSH identities can still participate in an allowed SSH push.
 - FileMCP-generated tunnel profiles live in an app-owned profile directory. `tunnel-client` receives an allowlisted child environment so ambient tunnel configuration cannot silently replace the local MCP target, health policy, or raw HTTP logging policy.
-- Runtime API keys belong in the platform credential store (macOS Keychain or Windows Credential Manager), never the plain settings file.
+- Runtime API keys belong in the platform credential store (macOS Keychain, Windows Credential Manager or the Linux Secret Service), never the plain settings file. On Linux the key is exchanged with `secret-tool` over pipes only; when no Secret Service is available it is kept in memory for the session, never written to disk.
+- On Linux, child processes run in their own `setsid` session/process group, and long-lived children receive a parent-death signal so a crashed FileMCP does not leave `tunnel-client` or command sessions running. Per-user state lives in `0700` XDG directories (`~/.local/share/filemcp`, `$XDG_RUNTIME_DIR/filemcp`).
 
 ## Sensitive areas
 
@@ -44,9 +45,9 @@ Changes involving any of the following deserve explicit security review:
 - path canonicalization, symbolic links, junctions, or reparse-point handling;
 - file deletion or write boundaries;
 - Git worktree/Git/common/object/config metadata, alternates, embedded repositories, config includes, hooks, filters, credential helpers, transports, or external diff behavior;
-- `run_command`, process groups/Job Objects, and descendant-process lifecycle;
+- `run_command`, process groups/Job Objects/`setsid` sessions and parent-death signals, and descendant-process lifecycle;
 - HTTP framing, local-auth/Host/Origin validation, MCP protocol negotiation, and tool argument validation;
-- Keychain/Credential Manager storage, tunnel profile/environment isolation, health/admin binding, or secret propagation to `tunnel-client`;
+- Keychain/Credential Manager/Secret Service storage, tunnel profile/environment isolation, health/admin binding, or secret propagation to `tunnel-client`;
 - vendored `tunnel-client` updates and release checksum verification.
 
 ## Secrets in reports and tests

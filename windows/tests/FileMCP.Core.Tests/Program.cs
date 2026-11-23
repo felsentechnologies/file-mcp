@@ -26,17 +26,25 @@ internal static partial class Program
             return await RunFakeTunnelClientAsync(args);
         if (args.Length > 0 && args[0] == "app-server" && Environment.GetEnvironmentVariable("FILEMCP_TEST_FAKE_CODEX") == "1")
             return await RunFakeCodexAppServerAsync();
+        if (args.Length == 2 && args[0] == "orphan-probe")
+            return await RunOrphanProbeAsync(args[1]);
 
-        if (!OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
         {
-            Console.WriteLine("windows-tests: skipped (Windows required)");
+            Console.WriteLine("core-tests: skipped (Windows or Linux required)");
             return 0;
         }
 
-        var root = Path.Combine(Path.GetTempPath(), "filemcp-windows-tests-" + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(Path.GetTempPath(), $"filemcp-{Platform}-tests-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
+        if (!IsWindows)
+        {
+            // Keep Git safe-mode resources and tunnel state out of the developer's real ~/.local/share.
+            Environment.SetEnvironmentVariable("XDG_DATA_HOME", Path.Combine(root, "xdg-data"));
+        }
         try
         {
+            await TestPlatformAsync(root);
             await TestSettingsAndCredentialsAsync(root);
             await TestProcessRunnerAsync(root);
             await TestFilesystemAndToolsAsync(root);
@@ -45,7 +53,7 @@ internal static partial class Program
             await TestGitSafetyAsync(root);
             await TestHttpAndMcpAsync(root);
             await TestRuntimeAsync(root);
-            Console.WriteLine($"windows-core-tests: ok ({_assertions} assertions)");
+            Console.WriteLine($"{Platform}-core-tests: ok ({_assertions} assertions)");
             return 0;
         }
         catch (Exception ex)
@@ -55,7 +63,7 @@ internal static partial class Program
                 .Replace("%", "%25", StringComparison.Ordinal)
                 .Replace("\r", "%0D", StringComparison.Ordinal)
                 .Replace("\n", "%0A", StringComparison.Ordinal);
-            Console.Error.WriteLine($"::error file=windows/tests/FileMCP.Core.Tests/Program.cs,title=Windows integration failure::{annotation}");
+            Console.Error.WriteLine($"::error file=windows/tests/FileMCP.Core.Tests/Program.cs,title={(IsWindows ? "Windows" : "Linux")} integration failure::{annotation}");
             return 1;
         }
         finally
@@ -78,8 +86,7 @@ internal static partial class Program
         Assert(loaded.TunnelId == settings.TunnelId && loaded.Profile == settings.Profile && loaded.EnableCommands, "settings roundtrip");
         Assert(!File.ReadAllText(Path.Combine(settingsDir, "settings.json")).Contains("apiKey", StringComparison.OrdinalIgnoreCase), "settings contain no API key");
 
-        var target = "FileMCP/tests/" + Guid.NewGuid().ToString("N");
-        var credentials = new WindowsCredentialStore(target);
+        var credentials = CreateTestCredentialStore(root, out var credentialMode);
         try
         {
             credentials.SaveApiKey("sk-test-filemcp");
@@ -87,31 +94,113 @@ internal static partial class Program
             Assert(credentials.ReadApiKey() == "sk-test-filemcp", "credential roundtrip");
             credentials.DeleteApiKey();
             Assert(!credentials.HasSavedApiKey, "credential delete");
+            credentials.DeleteApiKey();
+            Assert(!credentials.HasSavedApiKey, "credential delete is idempotent");
         }
         finally { try { credentials.DeleteApiKey(); } catch { } }
-        Console.WriteLine("windows-settings-credentials: ok");
+        Console.WriteLine($"{Platform}-settings-credentials: ok ({credentialMode})");
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Windows uses Credential Manager. Linux uses the real Secret Service when one is reachable (CI starts
+    /// gnome-keyring inside dbus-run-session) and otherwise a fake secret-tool that checks the CLI protocol.
+    /// FILEMCP_TEST_SECRET_SERVICE=real|fake forces a mode.
+    /// </summary>
+    private static IApiKeyStore CreateTestCredentialStore(string root, out string mode)
+    {
+        var suffix = Guid.NewGuid().ToString("N");
+        if (IsWindows) { mode = "credential-manager"; return new WindowsCredentialStore("FileMCP/tests/" + suffix); }
+
+        var requested = Environment.GetEnvironmentVariable("FILEMCP_TEST_SECRET_SERVICE") ?? "auto";
+        var service = "FileMCP-tests-" + suffix;
+        if (requested is "real" or "auto")
+        {
+            var real = new SecretServiceCredentialStore(service);
+            try
+            {
+                real.DeleteApiKey();
+                mode = "secret-service";
+                return real;
+            }
+            catch (FileMcpException) when (requested == "auto")
+            {
+            }
+        }
+
+        var storeDirectory = Path.Combine(root, "fake-secret-service"); Directory.CreateDirectory(storeDirectory);
+        var script = Path.Combine(root, "fake-secret-tool");
+        File.WriteAllText(script, $$"""
+            #!/bin/sh
+            set -eu
+            dir='{{storeDirectory}}'
+            cmd="$1"; shift
+            case "$cmd" in
+              store)
+                [ "$1" = "--label=FileMCP runtime API key" ] || { echo "bad label" >&2; exit 2; }
+                shift; key=$(printf '%s_' "$@" | tr -c 'A-Za-z0-9_.-' '_')
+                cat > "$dir/$key" ;;
+              lookup)
+                key=$(printf '%s_' "$@" | tr -c 'A-Za-z0-9_.-' '_')
+                [ -f "$dir/$key" ] || exit 1
+                cat "$dir/$key" ;;
+              clear)
+                key=$(printf '%s_' "$@" | tr -c 'A-Za-z0-9_.-' '_')
+                [ -f "$dir/$key" ] || exit 1
+                rm -f "$dir/$key" ;;
+              *) echo "unsupported" >&2; exit 2 ;;
+            esac
+            """.Replace("\r\n", "\n"));
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        mode = "fake-secret-tool";
+        return new SecretServiceCredentialStore(service, secretToolPath: script);
     }
 
     private static async Task TestProcessRunnerAsync(string root)
     {
-        var timeout = await ProcessRunner.RunAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 10"], timeoutSeconds: 1);
+        var timeout = await RunShellAsync(IsWindows ? "Start-Sleep -Seconds 10" : "sleep 10", timeoutSeconds: 1);
         Assert(timeout.TimedOut, "process timeout");
 
-        var bounded = await ProcessRunner.RunAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "'x' * 150000"], timeoutSeconds: 5, outputLimitBytes: 10_000);
+        var bounded = await RunShellAsync(IsWindows ? "'x' * 150000" : "head -c 150000 /dev/zero | tr '\\0' x", timeoutSeconds: 5, outputLimitBytes: 10_000);
         Assert(bounded.Stdout.Contains("[...truncated ", StringComparison.Ordinal), "bounded process output");
 
         var pidFile = Path.Combine(root, "child.pid");
-        var escaped = pidFile.Replace("'", "''", StringComparison.Ordinal);
-        var script = "$p=Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 20' -PassThru; Set-Content -LiteralPath '" + escaped + "' -Value $p.Id";
-        var parent = await ProcessRunner.RunAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], timeoutSeconds: 5);
+        string script;
+        if (IsWindows)
+        {
+            var escaped = pidFile.Replace("'", "''", StringComparison.Ordinal);
+            script = "$p=Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 20' -PassThru; Set-Content -LiteralPath '" + escaped + "' -Value $p.Id";
+        }
+        else
+        {
+            // The background child outlives its parent shell; the process-group sweep must still reap it.
+            script = "sleep 20 & echo $! > " + ShellQuote(pidFile);
+        }
+        var parent = await RunShellAsync(script, timeoutSeconds: 5);
         Assert(parent.ExitCode == 0 && File.Exists(pidFile), "descendant fixture");
         await Task.Delay(500);
         var childPid = int.Parse(File.ReadAllText(pidFile).Trim());
-        var childAlive = false;
-        try { using var child = Process.GetProcessById(childPid); childAlive = !child.HasExited; } catch (ArgumentException) { }
-        Assert(!childAlive, "job object descendant cleanup");
-        Console.WriteLine("windows-process-runner: ok");
+        Assert(await WaitForProcessExitAsync(childPid, TimeSpan.FromSeconds(5)), IsWindows ? "job object descendant cleanup" : "process group descendant cleanup");
+
+        if (!IsWindows)
+        {
+            // Simulate a FileMCP crash: a child FileMCP-like process starts a long-lived managed command and exits
+            // without any cleanup. PR_SET_PDEATHSIG (setpriv) must stop the orphaned command.
+            var orphanPidFile = Path.Combine(root, "orphan.pid");
+            var probe = await ProcessRunner.RunAsync(SelfLauncher(root), ["orphan-probe", orphanPidFile], timeoutSeconds: 30);
+            Assert(probe.ExitCode == 0 && File.Exists(orphanPidFile), $"orphan probe ran: exit={probe.ExitCode} stderr={probe.Stderr}");
+            var orphanPid = int.Parse(File.ReadAllText(orphanPidFile).Trim());
+            if (FileMcpPlatform.FindSystemTool("setpriv") is not null)
+                Assert(await WaitForProcessExitAsync(orphanPid, TimeSpan.FromSeconds(5)), "parent-death signal stops long-lived children after a crash");
+            else
+                try { Process.GetProcessById(orphanPid).Kill(); } catch { }
+
+            await AssertThrowsAsync(() => ProcessRunner.RunAsync("definitely-not-a-filemcp-command", [], timeoutSeconds: 5), "executable not found", "missing executable reported");
+            var group = await ProcessRunner.RunAsync("/bin/sh", ["-c", "ps -o pgid= -p $$; echo $$"], timeoutSeconds: 5);
+            var lines = group.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            Assert(lines.Length == 2 && lines[0] == lines[1], "child leads its own process group");
+        }
+        Console.WriteLine($"{Platform}-process-runner: ok");
     }
 
     private static async Task TestFilesystemAndToolsAsync(string root)
@@ -416,16 +505,42 @@ internal static partial class Program
         var list = await safe.CallAsync("list_files", Obj(("subpath", "docs")));
         Assert(list.StructuredContent["result"]!.AsArray().Any(n => n!.GetValue<string>() == "note.txt"), "list files");
 
-        await full.CallAsync("run_command", Obj(("command", "Write-Output windows-command-ok"), ("cwd", ""), ("timeout_seconds", 5)));
-        var command = await full.CallAsync("run_command", Obj(("command", "Write-Output windows-command-ok"), ("timeout_seconds", 5)));
-        Assert(command.StructuredContent["result"]!.GetValue<string>().Contains("windows-command-ok"), "run command");
+        var echoCommand = IsWindows ? $"Write-Output {Platform}-command-ok" : $"echo {Platform}-command-ok";
+        await full.CallAsync("run_command", Obj(("command", echoCommand), ("cwd", ""), ("timeout_seconds", 5)));
+        var command = await full.CallAsync("run_command", Obj(("command", echoCommand), ("timeout_seconds", 5)));
+        Assert(command.StructuredContent["result"]!.GetValue<string>().Contains($"{Platform}-command-ok"), "run command");
 
-        await AssertThrowsAsync(() => safe.CallAsync("read_file", Obj(("relative_path", "..\\outside.txt"))), "outside the shared directory", "lexical traversal refused");
+        await AssertThrowsAsync(() => safe.CallAsync("read_file", Obj(("relative_path", IsWindows ? "..\\outside.txt" : "../outside.txt"))), "outside the shared directory", "lexical traversal refused");
 
         var outside = Path.Combine(root, "outside"); Directory.CreateDirectory(outside); File.WriteAllText(Path.Combine(outside, "secret.txt"), "outside-secret"); File.WriteAllText(Path.Combine(outside, "package.json"), "{}");
         var junction = Path.Combine(workspace, "escape");
-        var mklink = await ProcessRunner.RunAsync("cmd.exe", ["/d", "/c", "mklink", "/J", junction, outside], timeoutSeconds: 5);
-        Assert(mklink.ExitCode == 0, $"junction fixture: exit={mklink.ExitCode} stdout={mklink.Stdout} stderr={mklink.Stderr}");
+        if (IsWindows)
+        {
+            var mklink = await ProcessRunner.RunAsync("cmd.exe", ["/d", "/c", "mklink", "/J", junction, outside], timeoutSeconds: 5);
+            Assert(mklink.ExitCode == 0, $"junction fixture: exit={mklink.ExitCode} stdout={mklink.Stdout} stderr={mklink.Stderr}");
+        }
+        else
+        {
+            Directory.CreateSymbolicLink(junction, outside);
+            File.CreateSymbolicLink(Path.Combine(workspace, "escape-file.txt"), Path.Combine(outside, "secret.txt"));
+            Directory.CreateDirectory(Path.Combine(workspace, "nested-link-parent"));
+            Directory.CreateSymbolicLink(Path.Combine(workspace, "nested-link-parent", "up"), root);
+            await AssertThrowsAsync(() => safe.CallAsync("read_file", Obj(("relative_path", "escape-file.txt"))), "outside the shared directory", "file symlink read refused");
+            await AssertThrowsAsync(() => safe.CallAsync("write_file", Obj(("relative_path", "escape-file.txt"), ("content", "overwrite"))), "outside the shared directory", "file symlink write refused");
+            await AssertThrowsAsync(() => safe.CallAsync("write_file", Obj(("relative_path", "nested-link-parent/up/outside/new.txt"), ("content", "x"))), "outside the shared directory", "intermediate symlink write refused");
+            Assert(File.ReadAllText(Path.Combine(outside, "secret.txt")) == "outside-secret" && !File.Exists(Path.Combine(outside, "new.txt")), "symlink escapes did not modify outside files");
+            var caseVariant = await safe.CallAsync("write_file", Obj(("relative_path", "CaseSensitive.txt"), ("content", "upper")));
+            await safe.CallAsync("write_file", Obj(("relative_path", "casesensitive.txt"), ("content", "lower")));
+            Assert(caseVariant.StructuredContent["result"]!.GetValue<string>().Contains("Wrote") &&
+                File.ReadAllText(Path.Combine(workspace, "CaseSensitive.txt")) == "upper" &&
+                File.ReadAllText(Path.Combine(workspace, "casesensitive.txt")) == "lower", "Linux paths are case-sensitive");
+            await safe.CallAsync("write_file", Obj(("relative_path", "back\\slash.txt"), ("content", "slash")));
+            var slashList = await safe.CallAsync("list_files", Obj());
+            Assert(File.Exists(Path.Combine(workspace, "back\\slash.txt")) && slashList.StructuredContent["result"]!.AsArray().Any(n => n!.GetValue<string>() == "back\\slash.txt"), "backslash is a file-name character on Linux");
+            await safe.CallAsync("delete_file", Obj(("relative_path", "escape-file.txt")));
+            await safe.CallAsync("delete_file", Obj(("relative_path", "nested-link-parent/up")));
+            Assert(File.Exists(Path.Combine(outside, "secret.txt")) && Directory.Exists(root), "symlink delete removes link only");
+        }
         await AssertThrowsAsync(() => safe.CallAsync("read_file", Obj(("relative_path", "escape/secret.txt"))), "outside the shared directory", "junction read refused");
         var rankedEscape = await safe.CallAsync("search_code", Obj(("queries", new JsonArray("outside-secret")), ("max_results_per_query", 3)));
         Assert(rankedEscape.StructuredContent["query_results"]!.AsArray()[0]!["observed_matching_lines"]!.GetValue<int>() == 0, "ranked code does not traverse junctions");
@@ -441,7 +556,7 @@ internal static partial class Program
         await safe.CallAsync("delete_file", Obj(("relative_path", "docs/note.txt")));
         await safe.CallAsync("delete_directory", Obj(("relative_path", "docs")));
         Assert(!Directory.Exists(Path.Combine(workspace, "docs")), "delete directory");
-        Console.WriteLine("windows-filesystem-tools: ok");
+        Console.WriteLine($"{Platform}-filesystem-tools: ok");
     }
 
     private static async Task TestCodexHistoryAsync(string root)
@@ -454,9 +569,7 @@ internal static partial class Program
         var oldFake = Environment.GetEnvironmentVariable("FILEMCP_TEST_FAKE_CODEX");
         var oldFakeHome = Environment.GetEnvironmentVariable("FILEMCP_TEST_CODEX_HOME");
         var oldFakeCorruptTurns = Environment.GetEnvironmentVariable("FILEMCP_TEST_FAKE_CODEX_CORRUPT_TURNS");
-        var testAssembly = typeof(Program).Assembly.Location;
-        var fakeLauncher = Path.ChangeExtension(testAssembly, ".exe");
-        if (!File.Exists(fakeLauncher)) throw new Exception("Windows test apphost executable is unavailable");
+        var fakeLauncher = SelfLauncher(root);
         Environment.SetEnvironmentVariable("CODEX_BIN", fakeLauncher);
         Environment.SetEnvironmentVariable("FILEMCP_TEST_FAKE_CODEX", "1");
         Environment.SetEnvironmentVariable("FILEMCP_TEST_CODEX_HOME", codexHome);
@@ -512,7 +625,7 @@ internal static partial class Program
             Environment.SetEnvironmentVariable("FILEMCP_TEST_FAKE_CODEX_CORRUPT_TURNS", null);
             var filesAfterFailedImport = Directory.EnumerateFiles(Path.Combine(codexHome, "sessions"), "*.jsonl", SearchOption.AllDirectories).Count();
             Assert(filesAfterFailedImport == filesBeforeFailedImport, "Codex Windows failed import cleaned its rollout");
-            Console.WriteLine("windows-codex-history: ok");
+            Console.WriteLine($"{Platform}-codex-history: ok");
         }
         finally
         {
@@ -536,13 +649,13 @@ internal static partial class Program
             await using var cleanup = new CodexAppServerClient(realCodex);
             _ = await cleanup.InitializeAsync(CancellationToken.None);
             _ = await cleanup.RequestAsync("thread/delete", new JsonObject { ["threadId"] = imported.ThreadId });
-            Console.WriteLine("windows-codex-history-real: ok");
+            Console.WriteLine($"{Platform}-codex-history-real: ok");
         }
     }
 
     private static async Task TestGitSafetyAsync(string root)
     {
-        var gitVersion = await ProcessRunner.RunAsync("git.exe", ["--version"], timeoutSeconds: 10);
+        var gitVersion = await ProcessRunner.RunAsync(LocalTools.GitExecutable, ["--version"], timeoutSeconds: 10);
         Assert(gitVersion.ExitCode == 0, "git available");
         var workspace = Path.Combine(root, "git"); Directory.CreateDirectory(workspace);
         var tools = new LocalTools(workspace, "FileMCP Test", "filemcp@example.invalid", false);
@@ -558,6 +671,8 @@ internal static partial class Program
         Directory.CreateDirectory(hooksDirectory);
         var hook = Path.Combine(hooksDirectory, "pre-commit");
         File.WriteAllText(hook, "#!/bin/sh\ntouch hook-ran\n", new UTF8Encoding(false));
+        // On Unix Git only runs executable hooks, so make the fixture one that would run without safe mode.
+        if (!IsWindows) File.SetUnixFileMode(hook, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         File.AppendAllText(Path.Combine(repo, "a.txt"), "two\n");
         await tools.CallAsync("git_add", Obj(("repo_path", "repo"), ("paths", "a.txt")));
         await tools.CallAsync("git_commit", Obj(("repo_path", "repo"), ("message", "safe commit")));
@@ -593,11 +708,11 @@ internal static partial class Program
         await AssertThrowsAsync(() => tools.CallAsync("git_status", Obj(("repo_path", "worktree-escape"))), "worktree is outside or different", "core.worktree escape refused");
 
         var bare = Path.Combine(root, "outside.git");
-        var initBare = await ProcessRunner.RunAsync("git.exe", ["init", "--bare", bare], timeoutSeconds: 20); Assert(initBare.ExitCode == 0, "bare remote fixture");
+        var initBare = await ProcessRunner.RunAsync(LocalTools.GitExecutable, ["init", "--bare", bare], timeoutSeconds: 20); Assert(initBare.ExitCode == 0, "bare remote fixture");
         await GitCli(repo, ["remote", "add", "origin", bare]);
         await GitCli(repo, ["config", "branch.main.remote", "origin"]); await GitCli(repo, ["config", "branch.main.merge", "refs/heads/main"]);
         await AssertThrowsAsync(() => tools.CallAsync("git_push", Obj(("repo_path", "repo"))), "transport 'file' not allowed", "local file push refused");
-        Console.WriteLine("windows-git-safe-mode: ok");
+        Console.WriteLine($"{Platform}-git-safe-mode: ok");
     }
 
     private static async Task TestHttpAndMcpAsync(string root)
@@ -668,14 +783,14 @@ internal static partial class Program
 
         var badHost = await SendHttpAsync(port, "POST", "/mcp", AuthHeaders(token), "", host: "evil.example");
         Assert(badHost.StartsWith("HTTP/1.1 403 Forbidden", StringComparison.Ordinal), "host validation");
-        Console.WriteLine("windows-http-mcp: ok");
+        Console.WriteLine($"{Platform}-http-mcp: ok");
     }
 
     private static async Task TestRuntimeAsync(string root)
     {
         var workspace = Path.Combine(root, "runtime-workspace"); Directory.CreateDirectory(workspace);
         var profiles = Path.Combine(root, "runtime-profiles"); var capture = Path.Combine(root, "tunnel-env.txt");
-        Environment.SetEnvironmentVariable("MCP_TUNNEL_CLIENT", Environment.ProcessPath);
+        Environment.SetEnvironmentVariable("MCP_TUNNEL_CLIENT", SelfLauncher(root));
         Environment.SetEnvironmentVariable("MCP_TEST_ENV_CAPTURE", capture);
         Environment.SetEnvironmentVariable("LOG_HTTP_RAW_UNSAFE", "true");
         Environment.SetEnvironmentVariable("MCP_SERVER_URL", "http://evil.invalid/mcp");
@@ -691,8 +806,25 @@ internal static partial class Program
             Assert(!captureText.Contains("LOG_HTTP_RAW_UNSAFE=true", StringComparison.Ordinal) && !captureText.Contains("MCP_SERVER_URL=http://evil", StringComparison.Ordinal), "dangerous tunnel env not inherited");
             Assert(!logs.ToString().Contains("sk-runtime-test-secret", StringComparison.Ordinal), "api key redacted");
             Assert(!System.Text.RegularExpressions.Regex.IsMatch(logs.ToString(), "[0-9a-f]{64}"), "local token redacted");
+            if (!IsWindows)
+            {
+                // Windows named mutexes are thread-reentrant, so this in-process contention check is Unix-only (flock).
+                var competing = new LocalMcpRuntime(Path.Combine(root, "runtime-profiles-competing"));
+                try
+                {
+                    await competing.StartAsync(config with { Port = (ushort)FreePort() });
+                    Assert(competing.State.Status == LocalMcpRuntimeStatus.Failed && competing.State.Error!.Contains("already in use", StringComparison.Ordinal), "profile lock prevents concurrent use");
+                }
+                finally { await competing.DisposeAsync(); }
+            }
             await runtime.StopAsync();
             Assert(runtime.State.Status == LocalMcpRuntimeStatus.Stopped, "runtime stopped");
+            if (!IsWindows)
+            {
+                await runtime.StartAsync(config with { Port = (ushort)FreePort() });
+                Assert(runtime.State.Status == LocalMcpRuntimeStatus.Running, "profile lock released after stop");
+                await runtime.StopAsync();
+            }
         }
         finally
         {
@@ -700,7 +832,24 @@ internal static partial class Program
             Environment.SetEnvironmentVariable("MCP_TUNNEL_CLIENT", null); Environment.SetEnvironmentVariable("MCP_TEST_ENV_CAPTURE", null);
             Environment.SetEnvironmentVariable("LOG_HTTP_RAW_UNSAFE", null); Environment.SetEnvironmentVariable("MCP_SERVER_URL", null);
         }
-        Console.WriteLine("windows-runtime-lifecycle: ok");
+        Console.WriteLine($"{Platform}-runtime-lifecycle: ok");
+    }
+
+    private static async Task<int> RunOrphanProbeAsync(string pidFile)
+    {
+        // Started from a thread-pool thread on purpose: LongLivedSpawner must still own the fork.
+        await Task.Yield();
+        _ = ProcessRunner.StartManaged("/bin/sh", ["-c", "echo $$ > " + ShellQuote(pidFile) + "; exec sleep 60"], null, null, _ => { }, _ => { });
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            try { if (int.TryParse(File.ReadAllText(pidFile).Trim(), out _)) break; } catch (IOException) { }
+            await Task.Delay(20);
+        }
+        // Let the thread pool retire idle workers; a spurious thread-bound PDEATHSIG would fire here.
+        await Task.Delay(300);
+        Environment.Exit(0); // No ManagedProcess cleanup, like a crash.
+        return 0;
     }
 
     private static async Task<int> RunFakeCodexAppServerAsync()
@@ -958,8 +1107,124 @@ internal static partial class Program
         await Task.Delay(Timeout.InfiniteTimeSpan); return 0;
     }
 
+    [System.Runtime.Versioning.SupportedOSPlatformGuard("windows")]
+    private static bool IsWindows => OperatingSystem.IsWindows();
+    private static string Platform => FileMcpPlatform.Name;
+
+    private static Task<ProcessResult> RunShellAsync(string script, int timeoutSeconds, int outputLimitBytes = ProcessRunner.DefaultOutputLimitBytes) =>
+        IsWindows
+            ? ProcessRunner.RunAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], timeoutSeconds: timeoutSeconds, outputLimitBytes: outputLimitBytes)
+            : ProcessRunner.RunAsync("/bin/sh", ["-c", script], timeoutSeconds: timeoutSeconds, outputLimitBytes: outputLimitBytes);
+
+    private static string ShellQuote(string value) => "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
+
+    private static async Task<bool> WaitForProcessExitAsync(int pid, TimeSpan timeout)
+    {
+        // An orphan killed by the process-group sweep is reaped asynchronously by init/the subreaper.
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < timeout)
+        {
+            if (!IsProcessRunning(pid)) return true;
+            await Task.Delay(50);
+        }
+        return !IsProcessRunning(pid);
+    }
+
+    /// <summary>
+    /// Returns an executable that re-enters this test program (fake tunnel-client / fake Codex). On Windows that is
+    /// the apphost. On Linux a small wrapper pins DOTNET_ROOT because tunnel-client runs with an allowlisted environment.
+    /// </summary>
+    private static string SelfLauncher(string root)
+    {
+        var testAssembly = typeof(Program).Assembly.Location;
+        if (IsWindows)
+        {
+            var apphost = Path.ChangeExtension(testAssembly, ".exe");
+            if (!File.Exists(apphost)) throw new Exception("Windows test apphost executable is unavailable");
+            return apphost;
+        }
+        var wrapper = Path.Combine(root, "self-launcher.sh");
+        if (File.Exists(wrapper)) return wrapper;
+        var runtimeDirectory = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory().TrimEnd('/');
+        var dotnetRoot = Path.GetFullPath(Path.Combine(runtimeDirectory, "..", "..", ".."));
+        var dotnet = Path.Combine(dotnetRoot, "dotnet");
+        if (!File.Exists(dotnet)) throw new Exception("Could not locate the dotnet host for the test self-launcher");
+        File.WriteAllText(wrapper, $"#!/bin/sh\nDOTNET_ROOT={ShellQuote(dotnetRoot)} exec {ShellQuote(dotnet)} {ShellQuote(testAssembly)} \"$@\"\n");
+        File.SetUnixFileMode(wrapper, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return wrapper;
+    }
+
+    private static async Task TestPlatformAsync(string root)
+    {
+        Assert(FileMcpConstants.ServerVersion == FileMcpConstants.Version + "-" + Platform, "platform server version");
+        if (IsWindows)
+        {
+            Assert(FileMcpPlatform.PathComparison == StringComparison.OrdinalIgnoreCase, "Windows paths compare case-insensitively");
+            Assert(FileMcpPlatform.ConfigDirectory == FileMcpPlatform.DataDirectory && FileMcpPlatform.DataDirectory.EndsWith(Path.Combine("", "FileMCP"), StringComparison.OrdinalIgnoreCase), "Windows keeps %LOCALAPPDATA%\\FileMCP");
+            Console.WriteLine("windows-platform: ok");
+            return;
+        }
+
+        Assert(FileMcpPlatform.PathComparison == StringComparison.Ordinal, "Linux paths compare case-sensitively");
+        var savedConfig = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
+        var savedData = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+        try
+        {
+            var config = Path.Combine(root, "xdg-config"); var data = Path.Combine(root, "xdg-data-probe");
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", config);
+            Environment.SetEnvironmentVariable("XDG_DATA_HOME", data);
+            Assert(FileMcpPlatform.ConfigDirectory == Path.Combine(config, "filemcp"), "XDG config directory");
+            Assert(FileMcpPlatform.DataDirectory == Path.Combine(data, "filemcp"), "XDG data directory");
+            Directory.CreateDirectory(config);
+            File.WriteAllText(Path.Combine(config, "user-dirs.dirs"), "# localized\nXDG_DOCUMENTS_DIR=\"$HOME/Documentos\"\n");
+            Assert(FileMcpPlatform.DefaultSharedDirectory == Path.Combine(FileMcpPlatform.HomeDirectory, "Documentos", "FileMCP"), "localized XDG documents directory");
+            File.WriteAllText(Path.Combine(config, "user-dirs.dirs"), "XDG_DOCUMENTS_DIR=\"$HOME/\"\n");
+            Assert(FileMcpPlatform.DefaultSharedDirectory == Path.Combine(FileMcpPlatform.HomeDirectory, "Documents", "FileMCP"), "disabled documents directory never shares HOME");
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", "relative/path");
+            Assert(FileMcpPlatform.ConfigDirectory == Path.Combine(FileMcpPlatform.HomeDirectory, ".config", "filemcp"), "relative XDG paths are ignored");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", savedConfig);
+            Environment.SetEnvironmentVariable("XDG_DATA_HOME", savedData);
+        }
+        Assert(FileMcpPlatform.ExpandUserPath("~/x") == Path.Combine(FileMcpPlatform.HomeDirectory, "x"), "tilde expansion");
+
+        var real = Path.Combine(root, "realpath-target"); Directory.CreateDirectory(real);
+        var link = Path.Combine(root, "realpath-link"); Directory.CreateSymbolicLink(link, real);
+        Assert(FileMcpPlatform.RealPath(Path.Combine(link, ".")) == FileMcpPlatform.RealPath(real), "realpath resolves directory links");
+
+        var privateDirectory = Path.Combine(root, "private-dir");
+        FileMcpPlatform.EnsurePrivateDirectory(privateDirectory);
+        Assert(File.GetUnixFileMode(privateDirectory) == (UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute), "private directory mode 0700");
+
+        // Linux environments commonly carry both http_proxy and HTTP_PROXY; they are distinct variables.
+        Environment.SetEnvironmentVariable("FILEMCP_CASE_PROBE", "upper");
+        Environment.SetEnvironmentVariable("filemcp_case_probe", "lower");
+        try
+        {
+            var environment = FileMcpPlatform.CurrentEnvironment();
+            Assert(environment["FILEMCP_CASE_PROBE"] == "upper" && environment["filemcp_case_probe"] == "lower", "case-sensitive environment snapshot");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("FILEMCP_CASE_PROBE", null);
+            Environment.SetEnvironmentVariable("filemcp_case_probe", null);
+        }
+
+        var workspace = Path.Combine(root, "mode-workspace"); Directory.CreateDirectory(workspace);
+        var script = Path.Combine(workspace, "run.sh");
+        File.WriteAllText(script, "#!/bin/sh\necho old\n");
+        File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        var tools = new LocalTools(workspace, "", "", false);
+        await tools.CallAsync("edit_file", Obj(("relative_path", "run.sh"), ("old_text", "old"), ("new_text", "new")));
+        await tools.CallAsync("write_file", Obj(("relative_path", "run.sh"), ("content", "#!/bin/sh\necho rewritten\n")));
+        Assert((File.GetUnixFileMode(script) & UnixFileMode.UserExecute) != 0 && File.ReadAllText(script).Contains("rewritten", StringComparison.Ordinal), "edits preserve the executable bit");
+        Console.WriteLine("linux-platform: ok");
+    }
+
     private static string ValueAfter(string[] args, string key) { var index = Array.IndexOf(args, key); return index >= 0 && index + 1 < args.Length ? args[index + 1] : throw new InvalidOperationException("missing " + key); }
-    private static async Task GitCli(string repo, string[] args) { var all = new List<string> { "-C", repo }; all.AddRange(args); var result = await ProcessRunner.RunAsync("git.exe", all, timeoutSeconds: 20); if (result.ExitCode != 0) throw new Exception("git fixture failed: " + result.Stderr); }
+    private static async Task GitCli(string repo, string[] args) { var all = new List<string> { "-C", repo }; all.AddRange(args); var result = await ProcessRunner.RunAsync(LocalTools.GitExecutable, all, timeoutSeconds: 20); if (result.ExitCode != 0) throw new Exception("git fixture failed: " + result.Stderr); }
     private static JsonObject Obj(params (string Key, object Value)[] values)
     {
         var obj = new JsonObject();

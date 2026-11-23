@@ -105,8 +105,8 @@ internal static class CodexHistoryImporter
 
     private static void ValidateInput(string title, string cwd, IReadOnlyList<CodexHistoryMessage> messages)
     {
-        if (!OperatingSystem.IsWindows())
-            throw new FileMcpException("Codex history import through the Windows implementation requires Windows.");
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            throw new FileMcpException("Codex history import through the .NET implementation requires Windows or Linux.");
         if (string.IsNullOrWhiteSpace(title)) throw new FileMcpException("title must not be empty");
         if (Encoding.UTF8.GetByteCount(title.Trim()) > MaxTitleBytes)
             throw new FileMcpException("title is too long (maximum 500 UTF-8 bytes)");
@@ -374,7 +374,7 @@ internal static class CodexHistoryImporter
         if (!Directory.Exists(sessionsPath)) throw new FileMcpException("Codex sessions directory does not exist.");
         var canonicalSessions = CanonicalizeExistingPath(sessionsPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var canonicalRollout = CanonicalizeExistingPath(rolloutPath);
-        if (!canonicalRollout.StartsWith(canonicalSessions + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        if (!canonicalRollout.StartsWith(canonicalSessions + Path.DirectorySeparatorChar, FileMcpPlatform.PathComparison))
             throw new FileMcpException("Codex returned a rollout path outside codexHome/sessions.");
         if (!Path.GetFileName(canonicalRollout).Contains(threadId, StringComparison.OrdinalIgnoreCase))
             throw new FileMcpException("Codex rollout filename does not match the created thread id.");
@@ -430,7 +430,8 @@ internal static class CodexHistoryImporter
 
     private static string LocateCodexExecutable()
     {
-        if (!OperatingSystem.IsWindows()) throw new FileMcpException("Codex Windows executable lookup requires Windows.");
+        if (OperatingSystem.IsLinux()) return LocateUnixCodexExecutable();
+        if (!OperatingSystem.IsWindows()) throw new FileMcpException("Codex executable lookup requires Windows or Linux.");
         var candidates = new List<string>();
         AddCandidate(candidates, Environment.GetEnvironmentVariable("CODEX_BIN"));
         AddCandidate(candidates, Environment.GetEnvironmentVariable("CODEX_CLI_PATH"));
@@ -492,15 +493,62 @@ internal static class CodexHistoryImporter
             "Codex executable was not found. Install Codex, place codex.exe on PATH, or set CODEX_BIN/CODEX_CLI_PATH.");
     }
 
+    /// <summary>
+    /// Linux search order: explicit overrides, the standalone installer layout under CODEX_HOME, common per-user
+    /// and system binary directories (desktop launchers often start FileMCP with a minimal PATH), then PATH.
+    /// </summary>
+    private static string LocateUnixCodexExecutable()
+    {
+        var candidates = new List<string>();
+        AddCandidate(candidates, Environment.GetEnvironmentVariable("CODEX_BIN"));
+        AddCandidate(candidates, Environment.GetEnvironmentVariable("CODEX_CLI_PATH"));
+        var installDir = Environment.GetEnvironmentVariable("CODEX_INSTALL_DIR");
+        if (!string.IsNullOrWhiteSpace(installDir)) AddCandidate(candidates, Path.Combine(installDir, "codex"));
+
+        var home = FileMcpPlatform.HomeDirectory;
+        var codexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
+        if (string.IsNullOrWhiteSpace(codexHome) && !string.IsNullOrWhiteSpace(home)) codexHome = Path.Combine(home, ".codex");
+        if (!string.IsNullOrWhiteSpace(codexHome))
+            AddCandidate(candidates, Path.Combine(codexHome, "packages", "standalone", "current", "codex"));
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            AddCandidate(candidates, Path.Combine(home, ".local", "bin", "codex"));
+            AddCandidate(candidates, Path.Combine(home, ".npm-global", "bin", "codex"));
+        }
+        AddCandidate(candidates, "/usr/local/bin/codex");
+        AddCandidate(candidates, "/usr/bin/codex");
+
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!Path.IsPathFullyQualified(directory)) continue;
+            AddCandidate(candidates, Path.Combine(directory, "codex"));
+        }
+
+        foreach (var candidate in candidates.Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                if (Path.IsPathFullyQualified(candidate) && FileMcpPlatform.IsExecutableFile(candidate)) return Path.GetFullPath(candidate);
+            }
+            catch
+            {
+                // Continue through the remaining candidates.
+            }
+        }
+        throw new FileMcpException(
+            "Codex executable was not found. Install Codex, place codex on PATH, or set CODEX_BIN/CODEX_CLI_PATH.");
+    }
+
     private static void AddCandidate(List<string> candidates, string? candidate)
     {
-        if (!string.IsNullOrWhiteSpace(candidate)) candidates.Add(Environment.ExpandEnvironmentVariables(candidate.Trim().Trim('"')));
+        if (!string.IsNullOrWhiteSpace(candidate)) candidates.Add(FileMcpPlatform.ExpandUserPath(candidate.Trim().Trim('"')));
     }
 
     private static string CanonicalizeExistingPath(string path)
     {
         var fullPath = Path.GetFullPath(path);
-        if (!OperatingSystem.IsWindows()) return fullPath;
+        if (!OperatingSystem.IsWindows()) return FileMcpPlatform.RealPath(fullPath);
         using var handle = NativeMethods.CreateFileW(
             fullPath,
             0,
@@ -562,7 +610,7 @@ internal static class CodexHistoryImporter
 internal sealed class CodexAppServerClient : IAsyncDisposable
 {
     private readonly Process _process;
-    private readonly WindowsJob? _job;
+    private readonly ProcessTreeGuard? _job;
     private readonly StreamWriter _stdin;
     private readonly StreamReader _stdout;
     private readonly Task _stderrTask;
@@ -573,7 +621,7 @@ internal sealed class CodexAppServerClient : IAsyncDisposable
 
     internal CodexAppServerClient(string executable)
     {
-        var startInfo = CreateStartInfo(executable);
+        var startInfo = CreateStartInfo(executable, out var processGroupLeader);
         _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         try
         {
@@ -586,7 +634,7 @@ internal sealed class CodexAppServerClient : IAsyncDisposable
         }
         try
         {
-            _job = WindowsJob.CreateAndAssign(_process);
+            _job = ProcessTreeGuard.CreateAndAssign(_process, processGroupLeader);
         }
         catch
         {
@@ -703,6 +751,8 @@ internal sealed class CodexAppServerClient : IAsyncDisposable
             try { await _process.WaitForExitAsync().ConfigureAwait(false); } catch { }
         }
         catch (InvalidOperationException) { }
+        // Reap helpers the app-server may have left in its process tree (Job Object / process group).
+        _job?.TerminateAfterLeaderExit();
         try { await _stderrTask.ConfigureAwait(false); } catch { }
         _job?.Dispose();
         _process.Dispose();
@@ -734,20 +784,17 @@ internal sealed class CodexAppServerClient : IAsyncDisposable
         }
     }
 
-    private static ProcessStartInfo CreateStartInfo(string executable)
+    private static ProcessStartInfo CreateStartInfo(string executable, out bool processGroupLeader)
     {
         var startInfo = new ProcessStartInfo
         {
-            FileName = executable,
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
         };
-        startInfo.ArgumentList.Add("app-server");
-        startInfo.ArgumentList.Add("--listen");
-        startInfo.ArgumentList.Add("stdio://");
+        processGroupLeader = ProcessRunner.ConfigureLaunch(startInfo, executable, ["app-server", "--listen", "stdio://"]);
         return startInfo;
     }
 }

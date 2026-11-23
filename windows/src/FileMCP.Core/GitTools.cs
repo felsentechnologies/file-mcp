@@ -1,4 +1,3 @@
-using System.Collections;
 using System.Text;
 
 namespace FileMCP.Core;
@@ -181,9 +180,9 @@ internal sealed partial class LocalTools
         try
         {
             var environment = SanitizedGitEnvironment(); environment["GIT_TERMINAL_PROMPT"] = "0";
-            if (!_enableCommands) { environment["GIT_ASKPASS"] = ""; environment["SSH_ASKPASS"] = ""; environment["GIT_SSH_COMMAND"] = "ssh.exe -F none -o BatchMode=yes -o ProxyCommand=none -o ProxyJump=none"; environment["GIT_PAGER"] = "cat"; }
+            if (!_enableCommands) { environment["GIT_ASKPASS"] = ""; environment["SSH_ASKPASS"] = ""; environment["GIT_SSH_COMMAND"] = SafeSshCommand; environment["GIT_PAGER"] = "cat"; }
             var allArgs = new List<string> { "-C", repo, "--no-pager" }; allArgs.AddRange(SafeGitConfigurationArguments()); allArgs.AddRange(arguments);
-            var result = await ProcessRunner.RunAsync("git.exe", allArgs, environment: environment, timeoutSeconds: 120, outputLimitBytes: outputLimitBytes, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var result = await ProcessRunner.RunAsync(GitExecutable, allArgs, environment: environment, timeoutSeconds: 120, outputLimitBytes: outputLimitBytes, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (result.TimedOut) throw new FileMcpException("git command timed out after 120 seconds");
             if (result.ExitCode != 0) throw new FileMcpException(string.IsNullOrWhiteSpace(result.Stderr) ? (result.Stdout.Length == 0 ? "git command failed" : result.Stdout) : result.Stderr.Trim());
             return trimOutput ? result.Stdout.Trim() : result.Stdout;
@@ -191,9 +190,16 @@ internal sealed partial class LocalTools
         finally { _gitSlots.Release(); }
     }
 
+    internal static string GitExecutable => FileMcpPlatform.ExecutableFileName("git");
+
+    // "-F none" is the Windows OpenSSH spelling of "ignore ssh_config"; OpenSSH on Unix uses /dev/null.
+    private static string SafeSshCommand => FileMcpPlatform.IsWindows
+        ? "ssh.exe -F none -o BatchMode=yes -o ProxyCommand=none -o ProxyJump=none"
+        : "ssh -F /dev/null -o BatchMode=yes -o ProxyCommand=none -o ProxyJump=none";
+
     private Dictionary<string, string> SanitizedGitEnvironment()
     {
-        var environment = Environment.GetEnvironmentVariables().Cast<DictionaryEntry>().ToDictionary(e => (string)e.Key, e => (string?)e.Value ?? "", StringComparer.OrdinalIgnoreCase);
+        var environment = FileMcpPlatform.CurrentEnvironment();
         string[] exact = ["GIT_DIR","GIT_WORK_TREE","GIT_COMMON_DIR","GIT_OBJECT_DIRECTORY","GIT_ALTERNATE_OBJECT_DIRECTORIES","GIT_INDEX_FILE","GIT_GRAFT_FILE","GIT_SHALLOW_FILE","GIT_NAMESPACE","GIT_PREFIX","GIT_EXEC_PATH","GIT_CONFIG_PARAMETERS","GIT_CONFIG_COUNT","GIT_CEILING_DIRECTORIES","GIT_DISCOVERY_ACROSS_FILESYSTEM","GIT_EXTERNAL_DIFF"];
         foreach (var key in exact) environment.Remove(key);
         foreach (var key in environment.Keys.Where(key => key.StartsWith("GIT_CONFIG_KEY_", StringComparison.OrdinalIgnoreCase) || key.StartsWith("GIT_CONFIG_VALUE_", StringComparison.OrdinalIgnoreCase) || key.StartsWith("GIT_TRACE", StringComparison.OrdinalIgnoreCase)).ToList()) environment.Remove(key);
@@ -212,7 +218,7 @@ internal sealed partial class LocalTools
             "-c", "core.attributesFile=" + _safeGitEmptyFile,
             "-c", "core.excludesFile=" + _safeGitEmptyFile,
             "-c", "core.askPass=",
-            "-c", "core.sshCommand=ssh.exe -F none -o BatchMode=yes -o ProxyCommand=none -o ProxyJump=none",
+            "-c", "core.sshCommand=" + SafeSshCommand,
             "-c", "credential.helper=",
             "-c", "protocol.allow=never",
             "-c", "protocol.file.allow=never",
@@ -224,12 +230,12 @@ internal sealed partial class LocalTools
 
     private static (string EmptyFile, string HooksDirectory) PrepareSafeGitResources()
     {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (string.IsNullOrWhiteSpace(localAppData))
-            throw new FileMcpException("Could not locate the user Local Application Data directory for Git safe mode.");
+        var dataDirectory = FileMcpPlatform.DataDirectory;
+        if (string.IsNullOrWhiteSpace(dataDirectory) || !Path.IsPathFullyQualified(dataDirectory))
+            throw new FileMcpException("Could not locate the user application data directory for Git safe mode.");
 
-        var root = Path.Combine(localAppData, "FileMCP", "git-safe");
-        Directory.CreateDirectory(root);
+        var root = Path.Combine(dataDirectory, "git-safe");
+        FileMcpPlatform.EnsurePrivateDirectory(root);
         EnsureOrdinaryDirectory(root, "Git safe-mode directory");
 
         var hooks = Path.Combine(root, "hooks");
@@ -278,7 +284,8 @@ internal sealed partial class LocalTools
     {
         foreach (var raw in paths)
         {
-            var relative = raw.TrimEnd('/', '\\'); if (relative.Length == 0) continue; var candidate = Path.GetFullPath(Path.Combine(repo, relative));
+            // Backslash is an ordinary file-name character on Linux, so only trim it on Windows.
+            var relative = FileMcpPlatform.IsWindows ? raw.TrimEnd('/', '\\') : raw.TrimEnd('/'); if (relative.Length == 0) continue; var candidate = Path.GetFullPath(Path.Combine(repo, relative));
             if (!Directory.Exists(candidate) || !EntryExists(Path.Combine(candidate, ".git"))) continue;
             var rootRelative = _resolver.RelativePath(candidate); if (rootRelative.Length == 0) throw new FileMcpException("Could not validate embedded Git repository path safely");
             _ = await GitRepoAsync(rootRelative, cancellationToken).ConfigureAwait(false);
@@ -308,7 +315,8 @@ internal sealed partial class LocalTools
     {
         var trimmed = value.Trim(); if (trimmed.Length == 0) return [];
         var exact = Path.GetFullPath(Path.Combine(repo, trimmed));
-        if (exact.StartsWith(Path.GetFullPath(repo).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase) && EntryExists(exact)) return [trimmed];
+        var repoPrefix = Path.GetFullPath(repo).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (exact.StartsWith(repoPrefix, FileMcpPlatform.PathComparison) && EntryExists(exact)) return [trimmed];
         return ShellWords(trimmed);
     }
 
@@ -331,7 +339,7 @@ internal sealed partial class LocalTools
     }
 
     private static bool EntryExists(string path) { try { _ = File.GetAttributes(path); return true; } catch (FileNotFoundException) { return false; } catch (DirectoryNotFoundException) { return false; } }
-    private static string CanonicalForComparison(string path) => Path.GetFullPath(path).TrimEnd('\\', '/');
-    private static bool PathEquals(string lhs, string rhs) => string.Equals(CanonicalForComparison(lhs), CanonicalForComparison(rhs), StringComparison.OrdinalIgnoreCase);
+    private static string CanonicalForComparison(string path) => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    private static bool PathEquals(string lhs, string rhs) => string.Equals(CanonicalForComparison(lhs), CanonicalForComparison(rhs), FileMcpPlatform.PathComparison);
     private static IEnumerable<string> SplitLines(string value) => value.Split(['\r','\n'], StringSplitOptions.RemoveEmptyEntries);
 }

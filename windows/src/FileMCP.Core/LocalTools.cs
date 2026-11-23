@@ -209,9 +209,9 @@ internal sealed partial class LocalTools
             };
             if (_enableCommands)
             {
-                tools.Add(Tool("run_command", "Run a PowerShell command on the local machine. The command inherits the current user's environment and is not OS-sandboxed. cwd must stay inside the shared directory.",
+                tools.Add(Tool("run_command", $"Run a {ShellDisplayName} command on the local machine. The command inherits the current user's environment and is not OS-sandboxed. cwd must stay inside the shared directory.",
                     Props(
-                        ("command", StringProperty("PowerShell command to execute.")),
+                        ("command", StringProperty($"{ShellDisplayName} command to execute.")),
                         ("cwd", StringProperty("Working directory relative to the shared root.")),
                         ("timeout_seconds", IntegerProperty(1, ProcessRunner.MaxCommandTimeoutSeconds, ProcessRunner.DefaultCommandTimeoutSeconds))),
                     ["command"], false, destructive: true, openWorld: true));
@@ -503,7 +503,7 @@ internal sealed partial class LocalTools
         {
             var expected = Path.GetFullPath(Path.Combine(_resolver.Root, relative.Replace('/', Path.DirectorySeparatorChar)));
             return string.Equals(
-                TrimDirectorySeparators(_resolver.Resolve(relative)), TrimDirectorySeparators(expected), StringComparison.OrdinalIgnoreCase);
+                TrimDirectorySeparators(_resolver.Resolve(relative)), TrimDirectorySeparators(expected), FileMcpPlatform.PathComparison);
         }
         catch (Exception)
         {
@@ -1464,7 +1464,7 @@ internal sealed partial class LocalTools
         else
         {
             var temp = target + ".filemcp-" + Guid.NewGuid().ToString("N") + ".tmp";
-            try { File.WriteAllBytes(temp, data); File.Move(temp, target, true); }
+            try { File.WriteAllBytes(temp, data); FileMcpPlatform.ReplaceFile(temp, target, destinationMustExist: false); }
             finally { try { if (File.Exists(temp)) File.Delete(temp); } catch { } }
         }
         return $"{(append ? "Appended to" : "Wrote")} {relativePath} ({data.Length} bytes)";
@@ -1483,7 +1483,7 @@ internal sealed partial class LocalTools
     private string DeleteDirectory(string relativePath)
     {
         var target = _resolver.ResolveForDeletion(relativePath);
-        if (string.Equals(Path.GetFullPath(target).TrimEnd('\\'), Path.GetFullPath(_resolver.Root).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(TrimDirectorySeparators(Path.GetFullPath(target)), TrimDirectorySeparators(Path.GetFullPath(_resolver.Root)), FileMcpPlatform.PathComparison))
             throw new FileMcpException("Refusing to delete the shared root directory");
         var attributes = _resolver.GetAttributesWithoutFollowingFinalTarget(target, $"No such directory: {relativePath}");
         if ((attributes & FileAttributes.ReparsePoint) != 0 || (attributes & FileAttributes.Directory) == 0)
@@ -1565,8 +1565,9 @@ internal sealed partial class LocalTools
         await _commandSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var result = await ProcessRunner.RunAsync(PowerShellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], workdir,
-                Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>().ToDictionary(e => (string)e.Key, e => (string?)e.Value ?? "", StringComparer.OrdinalIgnoreCase),
+            var shell = ShellInvocation(command);
+            var result = await ProcessRunner.RunAsync(shell.Executable, shell.Arguments, workdir,
+                FileMcpPlatform.CurrentEnvironment(),
                 timeoutSeconds, FileMcpConstants.MaxToolProcessOutputBytes, cancellationToken).ConfigureAwait(false);
             if (result.TimedOut)
             {
@@ -1578,6 +1579,31 @@ internal sealed partial class LocalTools
             return FormatProcessResult(result);
         }
         finally { _commandSlots.Release(); }
+    }
+
+    /// <summary>Name used in tool descriptions so the model writes commands for the right shell.</summary>
+    internal static string ShellDisplayName => FileMcpPlatform.IsWindows ? "PowerShell" : "POSIX shell";
+
+    /// <summary>
+    /// Windows runs Windows PowerShell non-interactively. Unix mirrors the macOS app: the user's login shell
+    /// (<c>$SHELL -lc</c>, falling back to <c>/bin/sh</c>) so PATH additions from shell profiles apply even when
+    /// FileMCP was started from a desktop launcher.
+    /// </summary>
+    internal static (string Executable, string[] Arguments) ShellInvocation(string command)
+    {
+        if (FileMcpPlatform.IsWindows) return (PowerShellPath(), ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]);
+        var shell = PreferredUnixShell();
+        // csh/tcsh only accept -l as the sole flag, so they run as plain non-login shells.
+        var name = Path.GetFileName(shell);
+        return name is "csh" or "tcsh" ? (shell, ["-c", command]) : (shell, ["-lc", command]);
+    }
+
+    private static string PreferredUnixShell()
+    {
+        var configured = Environment.GetEnvironmentVariable("SHELL");
+        if (!string.IsNullOrWhiteSpace(configured) && Path.IsPathFullyQualified(configured) && FileMcpPlatform.IsExecutableFile(configured))
+            return configured;
+        return "/bin/sh";
     }
 
     private static string PowerShellPath()
@@ -1605,8 +1631,12 @@ internal sealed partial class LocalTools
         return new ToolCallOutput(content, new JsonObject { ["result"] = result, ["truncated"] = value.Truncated });
     }
 
+    // Copy the default options so a type resolver is present: JsonArray.Add(string) can produce
+    // JsonValueCustomized<T> nodes, and serializing those with resolver-less options throws.
+    private static readonly JsonSerializerOptions IndentedJsonOptions = new(JsonSerializerOptions.Default) { WriteIndented = true };
+
     private static ToolCallOutput ObjectOutput(JsonObject value) => new(
-        new JsonArray(new JsonObject { ["type"] = "text", ["text"] = value.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) }), value);
+        new JsonArray(new JsonObject { ["type"] = "text", ["text"] = value.ToJsonString(IndentedJsonOptions) }), value);
 
     private static string GetRequiredString(JsonObject args, string key) => args[key] is JsonValue value && value.TryGetValue<string>(out var result) ? result : throw new FileMcpException($"Missing or invalid argument: {key}");
     private static int GetRequiredInt(JsonObject args, string key) => args[key] is JsonValue value && value.TryGetValue<int>(out var result) ? result : throw new FileMcpException($"Missing or invalid argument: {key}");
